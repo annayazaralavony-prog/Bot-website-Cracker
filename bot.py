@@ -109,9 +109,11 @@ SITE_PREFIX = "🌐 "
 
 MAX_ALBUM_BATCH = 10
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "2000")) * 1024 * 1024
-# [CHANGED] আগে ডিফল্ট ছিল 1200 MB; ১০টা বড় ভিডিও একসাথে রাখতে এখন ডিফল্ট 20000 MB।
-# সার্ভারের ডিস্ক কম হলে Environment-এ MAX_BATCH_MB কমিয়ে দিন।
+# ১০টা বড় ভিডিও একসাথে রাখতে ডিফল্ট 20000 MB। সার্ভারের ডিস্ক কম হলে MAX_BATCH_MB কমিয়ে দিন।
 MAX_BATCH_BYTES = int(os.environ.get("MAX_BATCH_MB", "20000")) * 1024 * 1024
+
+# [NEW] 1 = অ্যালবামের বাকি ফাইলে শুধু হ্যাশট্যাগ ক্যাপশন, 0 = বাকি ফাইলে কোনো ক্যাপশন নেই
+REST_CAPTION_HASHTAG = os.environ.get("REST_CAPTION_HASHTAG", "1") == "1"
 
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -937,18 +939,26 @@ async def download_file_with_details(url, dest_path, site_mod, state=None, progr
     return False, f"{last_err} (failed after 3 attempts)"
 
 
-# [CHANGED] সব পার্টের প্রতিটি ভিডিওতেই টাইটেল + একটি হ্যাশট্যাগ যাবে
+# [CHANGED] রিটার্ন: (প্রথম ফাইলের ক্যাপশন, বাকি ফাইলের ক্যাপশন, শুধু-হ্যাশট্যাগ ক্যাপশন)
+#   first    = টাইটেল + হ্যাশট্যাগ  (অ্যালবামের প্রথম ফাইল)
+#   rest     = শুধু হ্যাশট্যাগ (REST_CAPTION_HASHTAG=0 হলে ফাঁকা)
+#   tag_only = ফলব্যাকে সিঙ্গেল আপলোডের ক্যাপশন (সবসময় শুধু হ্যাশট্যাগ)
 def build_caption(title, a_idx, total_albums, part, multi_part, hashtag):
     single_tag = "#" + hashtag.lstrip("#").split()[0] if hashtag else "#mmsdesi"
+    tag_html = htmllib.escape(single_tag)
     clean_title = re.sub(r"#\S+", "", title or "").strip()
     if clean_title:
-        return f"<b>{htmllib.escape(clean_title[:200])}</b>\n{htmllib.escape(single_tag)}"
-    return htmllib.escape(single_tag)
+        first = f"<b>{htmllib.escape(clean_title[:200])}</b>\n{tag_html}"
+    else:
+        first = tag_html
+    rest = tag_html if REST_CAPTION_HASHTAG else ""
+    return first, rest, tag_html
 
 
 # uploader = {"type": "telethon"/"pyrogram", "client": ..., "name": ...}
 # প্রতিটি অ্যালবাম একটিমাত্র uploader (অ্যাকাউন্ট) দিয়েই সম্পূর্ণ আপলোড হবে
 async def send_album(files, caption, uploader=None):
+    first_cap, rest_cap = caption[0], caption[1]
     tclient = None
     if uploader and uploader.get("type") == "telethon":
         t_ok, _ = await ensure_telethon_connected(uploader["client"])
@@ -965,12 +975,12 @@ async def send_album(files, caption, uploader=None):
         if len(paths) == 1:
             await tclient.send_file(
                 STORAGE_CHANNEL_ID, paths[0],
-                caption=caption or None, parse_mode="html",
+                caption=first_cap or None, parse_mode="html",
                 supports_streaming=(files[0]["kind"] == "video")
             )
         else:
-            # [CHANGED] প্রতিটি ফাইলে ক্যাপশন
-            caps = [caption] * len(paths)
+            # [CHANGED] প্রথম ফাইলে টাইটেল+হ্যাশট্যাগ, বাকিতে শুধু হ্যাশট্যাগ
+            caps = [first_cap] + [rest_cap] * (len(paths) - 1)
             await tclient.send_file(
                 STORAGE_CHANNEL_ID, paths,
                 caption=caps, parse_mode="html",
@@ -981,19 +991,19 @@ async def send_album(files, caption, uploader=None):
             f = files[0]
             if f["kind"] == "video":
                 await pc.send_video(
-                    STORAGE_CHANNEL_ID, video=f["path"], caption=caption,
+                    STORAGE_CHANNEL_ID, video=f["path"], caption=first_cap,
                     parse_mode=enums.ParseMode.HTML, supports_streaming=True
                 )
             else:
                 await pc.send_photo(
-                    STORAGE_CHANNEL_ID, photo=f["path"], caption=caption,
+                    STORAGE_CHANNEL_ID, photo=f["path"], caption=first_cap,
                     parse_mode=enums.ParseMode.HTML
                 )
         else:
             media = []
             for i, f in enumerate(files):
-                # [CHANGED] প্রতিটি ফাইলে ক্যাপশন
-                cap = caption
+                # [CHANGED] প্রথম ফাইলে টাইটেল+হ্যাশট্যাগ, বাকিতে শুধু হ্যাশট্যাগ
+                cap = first_cap if i == 0 else rest_cap
                 if f["kind"] == "video":
                     media.append(InputMediaVideo(f["path"], caption=cap, parse_mode=enums.ParseMode.HTML, supports_streaming=True))
                 else:
@@ -1022,7 +1032,7 @@ async def send_batch(files, caption, state, uploader=None):
         if len(files) == 1:
             return [], [(files[0]["url"], f"{type(first_err).__name__}: {first_err}")]
 
-        # [NEW] সিঙ্গেল ফলব্যাকের আগে একবার অ্যালবাম রিট্রাই
+        # সিঙ্গেল ফলব্যাকের আগে একবার অ্যালবাম রিট্রাই
         print(f"⚠️ Album send failed ({type(first_err).__name__}: {first_err}) - retrying once...")
         await cancellable_sleep(3, state)
         try:
@@ -1033,12 +1043,12 @@ async def send_batch(files, caption, state, uploader=None):
         except Exception as second_err:
             print(f"⚠️ Album retry failed, fallback to single: {type(second_err).__name__}: {second_err}")
 
-        # ফলব্যাক: একই uploader দিয়েই ফাইলগুলো সিরিয়াল অনুযায়ী একটা একটা করে পাঠানো হবে
+        # [CHANGED] ফলব্যাক: যেগুলো ফেল করবে সেগুলো সিঙ্গেল আপলোড হবে, ক্যাপশনে শুধু হ্যাশট্যাগ
+        tag_only = caption[2]
         ok_files, failed = [], []
         for f in files:
             try:
-                # [CHANGED] প্রতিটি ফাইলে ক্যাপশন
-                await send_with_flood_retry([f], caption, state, uploader)
+                await send_with_flood_retry([f], (tag_only, tag_only, tag_only), state, uploader)
                 ok_files.append(f)
             except ScanCancelled:
                 raise
@@ -1282,7 +1292,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                     if cur:
                         groups.append(cur)
 
-                    # আপলোড: একই অ্যাকাউন্টে, একটার পর একটা পার্ট
+                    # আপলোড: একই অ্যাকাউন্টে, একটার পর একটা পার্ট (প্রতি পার্ট = একটি অ্যালবাম পোস্ট, সর্বোচ্চ ১০ ফাইল)
                     for g in groups:
                         check_cancel(state)
                         part += 1
@@ -1309,6 +1319,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                     except Exception:
                         pass
 
+            # [KEPT] একটি অ্যালবাম সম্পূর্ণ আপলোড হলে স্টোরেজ চ্যানেলে রিপোর্ট মেসেজ
             report = (
                 f"✅ <b>Album {a_idx}/{total_albums} completed</b>\n"
                 f"📁 {htmllib.escape(album['title'][:200])}\n"
