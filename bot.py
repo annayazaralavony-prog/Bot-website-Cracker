@@ -20,10 +20,23 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, RPCError
 
-# Telethon (ইউজার সেশন স্ট্রিং দিয়ে চ্যানেল স্ক্যান ও বড় ফাইল আপলোডের জন্য)
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, RPCError as TelethonRPCError
+# Telethon (ইউজার সেশন স্ট্রিং দিয়ে চ্যানেল স্ক্যান ও বড় ফাইল আপলোডের জন্য)
+# FIX: telethon ইনস্টল না থাকলেও বট ক্র্যাশ করবে না
+try:
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.errors import FloodWaitError, RPCError as TelethonRPCError
+    TELETHON_AVAILABLE = True
+except ImportError:
+    TELETHON_AVAILABLE = False
+    TelegramClient = None
+    StringSession = None
+
+    class FloodWaitError(Exception):
+        pass
+
+    class TelethonRPCError(Exception):
+        pass
 
 # ================= কনফিগারেশন (Environment Variables) =================
 API_ID = int(os.environ.get("API_ID", "123456"))
@@ -37,7 +50,7 @@ bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT
 
 # Telethon User Client (StringSession)
 telethon_client = None
-if TELETHON_SESSION_STRING:
+if TELETHON_AVAILABLE and TELETHON_SESSION_STRING:
     telethon_client = TelegramClient(StringSession(TELETHON_SESSION_STRING), API_ID, API_HASH)
 
 # ================= ডাটাবেস সেটআপ (ডুপ্লিকেট রোধ করার জন্য) =================
@@ -119,6 +132,8 @@ async def update_panel(client, user_id, text, reply_markup=None):
 
 # ================= Telethon কানেকশন চেক করার ফাংশন =================
 async def ensure_telethon_connected():
+    if not TELETHON_AVAILABLE:
+        return False, "Telethon library is not installed. Add 'telethon' to requirements.txt."
     if not telethon_client:
         return False, "TELETHON_SESSION_STRING is missing in Environment Variables."
     try:
@@ -153,7 +168,7 @@ async def start_cmd(client, message):
         "🤖 **HTML Media Scraper Dashboard**\n\n"
         f"⚡ **Telethon Engine:** `{engine_status}`\n"
         f"📦 **Storage Channel:** `{STORAGE_CHANNEL_ID}`\n\n"
-        "ওয়েবসাইটের HTML কোড বা ফাইল থেকে ভিডিও ও ছবি স্বয়ংক্রিয়ভাবে স্টোরেজ চ্যানেলে আপলোড করতে নিচের বাটনে ক্লিক করুন:"
+        "ওয়েবসাইটের HTML কোড বা ফাইল থেকে ভিডিও ও ছবি স্বয়ংক্রিয়ভাবে স্টোরেজ চ্যানেলে আপলোড করতে নিচের বাটনে ক্লিক করুন:"
     )
     await update_panel(client, user_id, welcome_text, get_home_keyboard())
 
@@ -214,7 +229,7 @@ async def handle_callbacks(client, cq):
             user_sessions[user_id]["buffer"] = []
             await update_panel(
                 client, user_id,
-                "🏷️ **Step 1: Select Section Hashtag**\n\nএই ওয়েবসাইটের ভিডিওগুলো চিহ্নিত করার জন্য নিচের যেকোনো একটি হ্যাশট্যাগ সিলেক্ট করুন:",
+                "🏷️ **Step 1: Select Section Hashtag**\n\nএই ওয়েবসাইটের ভিডিওগুলো চিহ্নিত করার জন্য নিচের যেকোনো একটি হ্যাশট্যাগ সিলেক্ট করুন:",
                 get_tags_keyboard()
             )
 
@@ -235,8 +250,8 @@ async def handle_callbacks(client, cq):
                     client, user_id,
                     f"✅ **Selected Hashtag:** `{selected}`\n\n"
                     f"📄 **Step 2: Send HTML File or Code**\n"
-                    f"এখন কোনো এডিট ছাড়াই সরাসরি `.html` ফাইল আপলোড করুন অথবা সম্পূর্ণ কোড কপি করে চ্যাটে পেস্ট করুন।\n"
-                    f"*(কোড ১০-১৫ ভাগে ভাগ হয়ে গেলেও বট সব এই এক মেসেজেই জমা করে নেবে)*",
+                    f"এখন কোনো এডিট ছাড়াই সরাসরি `.html` ফাইল আপলোড করুন অথবা সম্পূর্ণ কোড কপি করে চ্যাটে পেস্ট করুন।\n"
+                    f"*(কোড ১০-১৫ ভাগে ভাগ হয়ে গেলেও বট সব এই এক মেসেজেই জমা করে নেবে)*",
                     get_waiting_html_keyboard(0)
                 )
 
@@ -367,7 +382,7 @@ async def handle_document_input(client, message):
 def extract_media_from_html(html_content):
     soup = BeautifulSoup(html_content, "html.parser")
     page_title = soup.title.string.strip() if soup.title and soup.title.string else "Website Media"
-    
+
     videos = set()
     images = set()
 
@@ -393,12 +408,12 @@ async def download_file_with_details(url, dest_path):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     try:
-        timeout = aiohttp.ClientTimeout(total=1200) # ২০ মিনিট টাইমআউট বড় ভিডিওর জন্য
+        timeout = aiohttp.ClientTimeout(total=1200)  # ২০ মিনিট টাইমআউট বড় ভিডিওর জন্য
         async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
                     return False, f"HTTP Error {resp.status} ({resp.reason}) - Server blocked or file removed."
-                
+
                 with open(dest_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(1024 * 1024):
                         f.write(chunk)
@@ -416,7 +431,7 @@ async def download_file_with_details(url, dest_path):
         return False, f"{type(e).__name__}: {str(e)}"
 
 async def upload_to_channel(file_path, caption, is_video=True):
-    """Telethon Session থাকলে সেটি দিয়ে আপলোড করবে, না থাকলে বট দিয়ে আপলোড করবে"""
+    """Telethon Session থাকলে সেটি দিয়ে আপলোড করবে, না থাকলে বট দিয়ে আপলোড করবে"""
     t_ok, t_err = await ensure_telethon_connected()
     if t_ok:
         await telethon_client.send_file(
@@ -496,6 +511,8 @@ async def process_and_upload(client, user_id, html_content, hashtag):
             ok, err_reason = await download_file_with_details(v_url, temp_vid)
             if not ok:
                 error_logs.append(f"• [Video #{idx} Download Failed]\n  URL: {v_url[:45]}...\n  Reason: {err_reason}")
+                if os.path.exists(temp_vid):
+                    os.remove(temp_vid)
                 continue
 
             try:
@@ -515,6 +532,7 @@ async def process_and_upload(client, user_id, html_content, hashtag):
 
             except (FloodWait, FloodWaitError) as fw:
                 wait_sec = getattr(fw, "value", getattr(fw, "seconds", 10))
+                error_logs.append(f"• [Video #{idx} FloodWait]\n  Waited {wait_sec}s, file skipped (re-send HTML to retry).")
                 await asyncio.sleep(wait_sec)
             except (RPCError, TelethonRPCError) as rpc_err:
                 error_logs.append(
@@ -542,6 +560,8 @@ async def process_and_upload(client, user_id, html_content, hashtag):
             ok, err_reason = await download_file_with_details(img_url, temp_img)
             if not ok:
                 error_logs.append(f"• [Image #{idx} Download Failed]\n  URL: {img_url[:45]}...\n  Reason: {err_reason}")
+                if os.path.exists(temp_img):
+                    os.remove(temp_img)
                 continue
 
             try:
@@ -556,7 +576,7 @@ async def process_and_upload(client, user_id, html_content, hashtag):
                 if os.path.exists(temp_img):
                     os.remove(temp_img)
 
-        # ৩. চূড়ান্ত রিপোর্ট ও ইংরেজি এরর সামারি একই মেসেজে দেখানো
+        # ৩. চূড়ান্ত রিপোর্ট ও ইংরেজি এরর সামারি একই মেসেজে দেখানো
         summary_text = (
             f"🏁 **TASK COMPLETED REPORT**\n\n"
             f"⚡ **Engine Used:** `{uploader_mode}`\n"
@@ -580,7 +600,7 @@ async def process_and_upload(client, user_id, html_content, hashtag):
 
     except Exception as fatal_e:
         err_trace = traceback.format_exc()
-        user_sessions[user_id]["state"] = "IDLE"
+        user_sessions.setdefault(user_id, {})["state"] = "IDLE"
         await update_panel(
             client, user_id,
             f"🚨 **CRITICAL BOT FAILURE (UNHANDLED EXCEPTION)**\n\n"
@@ -603,5 +623,5 @@ def run_flask():
 
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
-    print("🤖 Starting Hybrid (Pyrogram + Telethon) Scraper Bot...")
+    print(f"🤖 Starting Hybrid Scraper Bot... (Telethon available: {TELETHON_AVAILABLE})")
     bot.run()
