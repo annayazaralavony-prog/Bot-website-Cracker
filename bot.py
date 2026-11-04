@@ -109,11 +109,16 @@ SITE_PREFIX = "🌐 "
 
 MAX_ALBUM_BATCH = 10
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "2000")) * 1024 * 1024
-# ১০টা বড় ভিডিও একসাথে রাখতে ডিফল্ট 20000 MB। সার্ভারের ডিস্ক কম হলে MAX_BATCH_MB কমিয়ে দিন।
-MAX_BATCH_BYTES = int(os.environ.get("MAX_BATCH_MB", "20000")) * 1024 * 1024
+# [CHANGED] ডিফল্ট 2000 MB (আগে 20000)। রেন্ডারের ডিস্ক ছোট, তাই প্রতি আপলোড-পার্টে সর্বোচ্চ এত MB ডিস্কে থাকবে।
+# মনে রাখবেন: মোট ডিস্ক ব্যবহার = অ্যাকাউন্ট সংখ্যা × এই লিমিট। ডিস্ক আরও কম হলে MAX_BATCH_MB কমান।
+MAX_BATCH_BYTES = int(os.environ.get("MAX_BATCH_MB", "2000")) * 1024 * 1024
 
 # [NEW] 1 = অ্যালবামের বাকি ফাইলে শুধু হ্যাশট্যাগ ক্যাপশন, 0 = বাকি ফাইলে কোনো ক্যাপশন নেই
 REST_CAPTION_HASHTAG = os.environ.get("REST_CAPTION_HASHTAG", "1") == "1"
+
+# [NEW] 1 = চ্যানেলে অ্যালবামগুলো ১, ২, ৩... ক্রমে পোস্ট হবে (ডাউনলোড সবাই একসাথে করবে, আপলোড ক্রমে)
+#       0 = যে অ্যালবাম আগে শেষ হয় সে আগে পোস্ট হবে (বেশি স্পিড)
+ORDERED_ALBUMS = os.environ.get("ORDERED_ALBUMS", "1") == "1"
 
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -1102,14 +1107,33 @@ async def start_scan(client, user_id, site, override_html=None):
 
 
 async def build_uploaders():
-    """প্রতিটি রেডি অ্যাকাউন্ট (Pyrogram User / Telethon) একটি করে worker। কিছু না থাকলে Pyrogram বট।"""
+    """প্রতিটি রেডি অ্যাকাউন্ট (Pyrogram User / Telethon) একটি করে worker। কিছু না থাকলে Pyrogram বট।
+    [CHANGED] একই টেলিগ্রাম অ্যাকাউন্ট Pyrogram ও Telethon দুই সেশনে থাকলে একবারই worker হবে।"""
     uploaders = []
+    seen_ids = set()
     for name, c in pyro_ready:
+        try:
+            uid = (await c.get_me()).id
+        except Exception:
+            uid = None
+        if uid is not None:
+            if uid in seen_ids:
+                continue
+            seen_ids.add(uid)
         uploaders.append({"type": "pyrogram", "client": c, "name": name})
     for i, c in enumerate(telethon_clients, start=1):
         ok, _ = await ensure_telethon_connected(c)
-        if ok:
-            uploaders.append({"type": "telethon", "client": c, "name": f"Telethon {i}"})
+        if not ok:
+            continue
+        try:
+            uid = (await c.get_me()).id
+        except Exception:
+            uid = None
+        if uid is not None:
+            if uid in seen_ids:
+                continue  # এই অ্যাকাউন্ট আগেই worker হিসেবে আছে
+            seen_ids.add(uid)
+        uploaders.append({"type": "telethon", "client": c, "name": f"Telethon {i}"})
     if not uploaders:
         uploaders.append({"type": "pyrogram", "client": bot, "name": "Bot Token"})
     return uploaders
@@ -1191,6 +1215,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         # ---------- ধাপ ১: সব অ্যালবামের জব তৈরি (ডুপ্লিকেট ফিল্টার, সিরিয়াল ঠিক রেখে) ----------
         seen_run = set()
         queue = asyncio.Queue()
+        prev_done = None  # [NEW] আগের অ্যালবামের "শেষ হয়েছে" ইভেন্ট (ORDERED_ALBUMS-এর জন্য)
         for a_idx, album in enumerate(albums, start=1):
             all_items = album["items"]
             v_found = sum(1 for k, _ in all_items if k == "video")
@@ -1213,10 +1238,13 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
 
             if not items:
                 continue
+            done_ev = asyncio.Event()
             queue.put_nowait({
                 "a_idx": a_idx, "album": album, "items": items, "all_items": all_items,
-                "v_found": v_found, "p_found": p_found, "prev_v": prev_v, "prev_p": prev_p
+                "v_found": v_found, "p_found": p_found, "prev_v": prev_v, "prev_p": prev_p,
+                "prev_done": prev_done, "done": done_ev
             })
+            prev_done = done_ev
 
         # ---------- ধাপ ২: একটি অ্যালবাম = একটি অ্যাকাউন্ট, সম্পূর্ণ সিরিয়ালি ----------
         async def process_album(job, uploader, wid):
@@ -1230,6 +1258,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
 
             a_up_v = a_up_p = a_fail = 0
             part = 0
+            waited = False  # [NEW] আগের অ্যালবামের জন্য অপেক্ষা একবারই করবে
             sem = asyncio.Semaphore(DOWNLOAD_PARALLEL)
 
             async def dl_one(item_idx, kind, url):
@@ -1295,6 +1324,15 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                     # আপলোড: একই অ্যাকাউন্টে, একটার পর একটা পার্ট (প্রতি পার্ট = একটি অ্যালবাম পোস্ট, সর্বোচ্চ ১০ ফাইল)
                     for g in groups:
                         check_cancel(state)
+
+                        # [NEW] ক্রম অনুযায়ী পোস্ট: আগের অ্যালবাম শেষ না হওয়া পর্যন্ত আপলোড শুরু হবে না
+                        # (ডাউনলোড আগেই হয়ে থাকে, তাই স্পিড বেশি নষ্ট হয় না)
+                        if ORDERED_ALBUMS and not waited and job.get("prev_done") is not None:
+                            ws["action"] = "⏳ আগের অ্যালবামের জন্য অপেক্ষা..."
+                            await refresh(force=True)
+                            await run_cancellable(job["prev_done"].wait(), state)
+                            waited = True
+
                         part += 1
                         mb = sum(f["size"] for f in g) // (1024 * 1024)
                         ws["action"] = f"⬆️ Uploading Part `{part}`: `{len(g)} files, {mb} MB`"
@@ -1352,6 +1390,9 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                         f"• [Album {job['a_idx']} Crashed]\n  Reason: {type(album_err).__name__}: {album_err}"
                     )
                     workers[wid].update({"a_idx": 0, "bytes": {}})
+                finally:
+                    # [NEW] সফল/ফেল/ক্যানসেল যাই হোক, পরের অ্যালবামকে ছেড়ে দাও - যাতে আটকে না থাকে
+                    job["done"].set()
 
         tasks = [asyncio.create_task(worker(i, u)) for i, u in enumerate(uploaders)]
         try:
