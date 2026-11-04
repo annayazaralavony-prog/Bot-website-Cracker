@@ -7,17 +7,38 @@ import aiohttp
 from threading import Thread
 from flask import Flask
 from bs4 import BeautifulSoup
+
+# ================= Python 3.14 Event Loop Fix =================
+# Pyrogram ইমপোর্ট করার আগেই মেইন থ্রেডে ইভেন্ট লুপ সেট করা হচ্ছে
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+# Pyrogram (বট বাটন ও সিঙ্গেল মেসেজ প্যানেলের জন্য)
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, RPCError
+
+# Telethon (ইউজার সেশন স্ট্রিং দিয়ে চ্যানেল স্ক্যান ও বড় ফাইল আপলোডের জন্য)
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError, RPCError as TelethonRPCError
 
 # ================= কনফিগারেশন (Environment Variables) =================
 API_ID = int(os.environ.get("API_ID", "123456"))
 API_HASH = os.environ.get("API_HASH", "your_api_hash")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
 STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", "-100123456789"))
+TELETHON_SESSION_STRING = os.environ.get("TELETHON_SESSION_STRING", "").strip()
 
-app = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Pyrogram Bot Client
+bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# Telethon User Client (StringSession)
+telethon_client = None
+if TELETHON_SESSION_STRING:
+    telethon_client = TelegramClient(StringSession(TELETHON_SESSION_STRING), API_ID, API_HASH)
 
 # ================= ডাটাবেস সেটআপ (ডুপ্লিকেট রোধ করার জন্য) =================
 conn = sqlite3.connect("scraped_data.db", check_same_thread=False)
@@ -44,7 +65,8 @@ user_sessions = {}
 # ================= কিবোর্ড বাটনসমূহ (Inline Buttons) =================
 def get_home_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("add HTML FILE 🗄️", callback_data="menu_add_html")]
+        [InlineKeyboardButton("add HTML FILE 🗄️", callback_data="menu_add_html")],
+        [InlineKeyboardButton("🔄 Sync Storage Channel (Telethon)", callback_data="action_sync_channel")]
     ])
 
 def get_tags_keyboard():
@@ -95,12 +117,25 @@ async def update_panel(client, user_id, text, reply_markup=None):
             )
             user_sessions.setdefault(user_id, {})["panel_msg_id"] = msg.id
 
+# ================= Telethon কানেকশন চেক করার ফাংশন =================
+async def ensure_telethon_connected():
+    if not telethon_client:
+        return False, "TELETHON_SESSION_STRING is missing in Environment Variables."
+    try:
+        if not telethon_client.is_connected():
+            await telethon_client.connect()
+        if not await telethon_client.is_user_authorized():
+            return False, "Telethon Session String is invalid or expired. Please generate a new one."
+        return True, "Connected"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)}"
+
 # ================= স্টার্ট কমান্ড ও বাটন কলব্যাক হ্যান্ডলার =================
-@app.on_message(filters.command("start") & filters.private)
+@bot.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
     user_id = message.from_user.id
     try:
-        await message.delete() # চ্যাট পরিষ্কার রাখতে ইউজারের /start মেসেজটি ডিলিট করবে
+        await message.delete()
     except Exception:
         pass
 
@@ -111,13 +146,18 @@ async def start_cmd(client, message):
         "panel_msg_id": user_sessions.get(user_id, {}).get("panel_msg_id")
     }
 
+    t_ok, t_status = await ensure_telethon_connected()
+    engine_status = "🟢 Active (Telethon Session)" if t_ok else f"🔴 Inactive ({t_status})"
+
     welcome_text = (
         "🤖 **HTML Media Scraper Dashboard**\n\n"
+        f"⚡ **Telethon Engine:** `{engine_status}`\n"
+        f"📦 **Storage Channel:** `{STORAGE_CHANNEL_ID}`\n\n"
         "ওয়েবসাইটের HTML কোড বা ফাইল থেকে ভিডিও ও ছবি স্বয়ংক্রিয়ভাবে স্টোরেজ চ্যানেলে আপলোড করতে নিচের বাটনে ক্লিক করুন:"
     )
     await update_panel(client, user_id, welcome_text, get_home_keyboard())
 
-@app.on_callback_query()
+@bot.on_callback_query()
 async def handle_callbacks(client, cq):
     user_id = cq.from_user.id
     data = cq.data
@@ -131,9 +171,41 @@ async def handle_callbacks(client, cq):
         if data == "menu_home":
             user_sessions[user_id]["state"] = "IDLE"
             user_sessions[user_id]["buffer"] = []
+            t_ok, t_status = await ensure_telethon_connected()
+            engine_status = "🟢 Active (Telethon Session)" if t_ok else f"🔴 Inactive ({t_status})"
             await update_panel(
                 client, user_id,
-                "🤖 **HTML Media Scraper Dashboard**\n\nনতুন ফাইল বা কোড স্ক্যান করতে নিচের বাটনে ক্লিক করুন:",
+                f"🤖 **HTML Media Scraper Dashboard**\n\n"
+                f"⚡ **Telethon Engine:** `{engine_status}`\n"
+                f"নতুন ফাইল বা কোড স্ক্যান করতে নিচের বাটনে ক্লিক করুন:",
+                get_home_keyboard()
+            )
+
+        elif data == "action_sync_channel":
+            await cq.answer("Syncing storage channel via Telethon...")
+            t_ok, t_err = await ensure_telethon_connected()
+            if not t_ok:
+                await update_panel(
+                    client, user_id,
+                    f"❌ **TELETHON CONNECTION FAILED**\n\n**Reason:** `{t_err}`",
+                    get_home_keyboard()
+                )
+                return
+
+            await update_panel(client, user_id, "🔄 **Scanning Storage Channel via Telethon...**\nChecking existing posts & media...")
+            count = 0
+            async for msg in telethon_client.iter_messages(STORAGE_CHANNEL_ID, limit=500):
+                if msg.text:
+                    urls = re.findall(r'https?://[^\s"\'<>]+', msg.text)
+                    for u in urls:
+                        mark_as_uploaded(u, "#synced")
+                count += 1
+
+            await update_panel(
+                client, user_id,
+                f"✅ **CHANNEL SYNC COMPLETED**\n\n"
+                f"• **Scanned Messages:** `{count} recent posts`\n"
+                f"• **Status:** `Database synced with Storage Channel via Telethon.`",
                 get_home_keyboard()
             )
 
@@ -192,12 +264,11 @@ async def handle_callbacks(client, cq):
         )
 
 # ================= টেক্সট ও ডকুমেন্ট ইনপুট হ্যান্ডলার =================
-@app.on_message(filters.text & filters.private)
+@bot.on_message(filters.text & filters.private)
 async def handle_text_input(client, message):
     user_id = message.from_user.id
     text = message.text.strip()
 
-    # চ্যাট পরিষ্কার রাখতে ইউজারের পাঠানো মেসেজ ডিলিট করে শুধু মেইন প্যানেলে আপডেট দেখানো
     try:
         await message.delete()
     except Exception:
@@ -237,7 +308,7 @@ async def handle_text_input(client, message):
             get_waiting_html_keyboard(parts)
         )
 
-@app.on_message(filters.document & filters.private)
+@bot.on_message(filters.document & filters.private)
 async def handle_document_input(client, message):
     user_id = message.from_user.id
     if user_id not in user_sessions:
@@ -255,7 +326,7 @@ async def handle_document_input(client, message):
             client, user_id,
             f"❌ **INVALID FILE FORMAT**\n\n"
             f"**File:** `{file_name}`\n"
-            f"**Reason:** `Only .html, .htm, or .txt files are supported. Please upload a valid file.`",
+            f"**Reason:** `Only .html, .htm, or .txt files are supported.`",
             get_waiting_html_keyboard(0)
         )
         return
@@ -266,7 +337,7 @@ async def handle_document_input(client, message):
     try:
         file_path = await message.download()
         try:
-            await message.delete() # ডাউনলোড শেষে ইউজারের ফাইল মেসেজটি ডিলিট করা
+            await message.delete()
         except Exception:
             pass
 
@@ -292,7 +363,7 @@ async def handle_document_input(client, message):
             get_home_keyboard()
         )
 
-# ================= স্ক্যান, ডাউনলোড ও ডিটেইলড এরর ট্র্যাকিং =================
+# ================= স্ক্যান, ডাউনলোড ও Telethon আপলোড লজিক =================
 def extract_media_from_html(html_content):
     soup = BeautifulSoup(html_content, "html.parser")
     page_title = soup.title.string.strip() if soup.title and soup.title.string else "Website Media"
@@ -300,12 +371,10 @@ def extract_media_from_html(html_content):
     videos = set()
     images = set()
 
-    # সরাসরি যেকোনো .mp4 লিংক খোঁজা
     raw_mp4s = re.findall(r'https?://[^\s"\'<>]+?\.mp4(?:\?[^\s"\'<>]*)?', html_content, re.IGNORECASE)
     for v in raw_mp4s:
         videos.add(v)
 
-    # HTML ট্যাগ থেকে ভিডিও ও ছবি খোঁজা
     for tag in soup.find_all(["video", "source", "a", "img"]):
         url = tag.get("src") or tag.get("data-src") or tag.get("href")
         if not url or not url.startswith("http"):
@@ -320,36 +389,56 @@ def extract_media_from_html(html_content):
     return page_title, list(videos), list(images)
 
 async def download_file_with_details(url, dest_path):
-    """Returns (Success_Boolean, Error_Reason_In_English)"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     try:
-        timeout = aiohttp.ClientTimeout(total=900) # ১৫ মিনিট টাইমআউট বড় ভিডিওর জন্য
+        timeout = aiohttp.ClientTimeout(total=1200) # ২০ মিনিট টাইমআউট বড় ভিডিওর জন্য
         async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
                     return False, f"HTTP Error {resp.status} ({resp.reason}) - Server blocked or file removed."
                 
-                content_length = resp.headers.get("Content-Length")
-                if content_length and int(content_length) > 2000 * 1024 * 1024:
-                    return False, "File size exceeds Telegram 2GB limit."
-
                 with open(dest_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(1024 * 1024):
                         f.write(chunk)
 
                 if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
-                    return False, "Downloaded file is 0 bytes (Empty response from server)."
+                    return False, "Downloaded file is 0 bytes (Empty response)."
 
                 return True, "OK"
 
     except asyncio.TimeoutError:
-        return False, "Connection Timeout: Server took too long to respond (>15 mins)."
+        return False, "Connection Timeout: Server took too long to respond (>20 mins)."
     except aiohttp.ClientConnectorError as e:
         return False, f"DNS/Connection Error: Cannot connect to host ({str(e)})."
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)}"
+
+async def upload_to_channel(file_path, caption, is_video=True):
+    """Telethon Session থাকলে সেটি দিয়ে আপলোড করবে, না থাকলে বট দিয়ে আপলোড করবে"""
+    t_ok, t_err = await ensure_telethon_connected()
+    if t_ok:
+        await telethon_client.send_file(
+            STORAGE_CHANNEL_ID,
+            file_path,
+            caption=caption,
+            supports_streaming=is_video
+        )
+    else:
+        if is_video:
+            await bot.send_video(
+                chat_id=STORAGE_CHANNEL_ID,
+                video=file_path,
+                caption=caption,
+                supports_streaming=True
+            )
+        else:
+            await bot.send_photo(
+                chat_id=STORAGE_CHANNEL_ID,
+                photo=file_path,
+                caption=caption
+            )
 
 async def process_and_upload(client, user_id, html_content, hashtag):
     try:
@@ -361,7 +450,7 @@ async def process_and_upload(client, user_id, html_content, hashtag):
                 client, user_id,
                 "⚠️ **NO MEDIA FOUND IN HTML**\n\n"
                 "**Diagnostic Report (English):**\n"
-                "• `Total HTML Length:` " + f"`{len(html_content)} chars`\n"
+                f"• `Total HTML Length:` `{len(html_content)} chars`\n"
                 "• `Direct .mp4 Links:` `0 found`\n"
                 "• `Valid Image Links:` `0 found`\n"
                 "• **Possible Cause:** The website might be loading videos dynamically via encrypted JavaScript (m3u8/blob) or requires login cookies.",
@@ -383,9 +472,12 @@ async def process_and_upload(client, user_id, html_content, hashtag):
             )
             return
 
+        t_ok, _ = await ensure_telethon_connected()
+        uploader_mode = "Telethon User Session" if t_ok else "Pyrogram Bot Token"
+
         uploaded_vids = 0
         uploaded_imgs = 0
-        error_logs = [] # সব ইংরেজি এরর এখানে জমা হবে
+        error_logs = []
 
         # ১. ভিডিও আপলোড লুপ
         for idx, v_url in enumerate(new_videos, start=1):
@@ -393,11 +485,12 @@ async def process_and_upload(client, user_id, html_content, hashtag):
             await update_panel(
                 client, user_id,
                 f"⏳ **Processing Media (Single Panel View)**\n\n"
+                f"⚡ **Uploader Engine:** `{uploader_mode}`\n"
                 f"📌 **Title:** `{title[:40]}`\n"
                 f"🏷️ **Hashtag:** `{hashtag}`\n"
                 f"⬇️ **Action:** `Downloading Video ({idx}/{len(new_videos)})`\n"
                 f"🔗 **URL:** `{v_url[:50]}...`\n"
-                f"✅ **Uploaded So Far:** `{uploaded_vids} Videos` | ❌ **Failed:** `{len(error_logs)}`"
+                f"✅ **Uploaded:** `{uploaded_vids} Videos` | ❌ **Failed:** `{len(error_logs)}`"
             )
 
             ok, err_reason = await download_file_with_details(v_url, temp_vid)
@@ -409,28 +502,25 @@ async def process_and_upload(client, user_id, html_content, hashtag):
                 await update_panel(
                     client, user_id,
                     f"⏳ **Processing Media (Single Panel View)**\n\n"
-                    f"⬆️ **Action:** `Uploading Video to Telegram ({idx}/{len(new_videos)})`\n"
+                    f"⚡ **Uploader Engine:** `{uploader_mode}`\n"
+                    f"⬆️ **Action:** `Uploading Video to Storage Channel ({idx}/{len(new_videos)})`\n"
                     f"📦 **File Size:** `{os.path.getsize(temp_vid) // (1024*1024)} MB`\n"
-                    f"✅ **Uploaded So Far:** `{uploaded_vids} Videos` | ❌ **Failed:** `{len(error_logs)}`"
+                    f"✅ **Uploaded:** `{uploaded_vids} Videos` | ❌ **Failed:** `{len(error_logs)}`"
                 )
                 caption = f"🎬 **{title}**\n\n{hashtag} #website"
-                await client.send_video(
-                    chat_id=STORAGE_CHANNEL_ID,
-                    video=temp_vid,
-                    caption=caption,
-                    supports_streaming=True
-                )
+                await upload_to_channel(temp_vid, caption, is_video=True)
                 mark_as_uploaded(v_url, hashtag)
                 uploaded_vids += 1
                 await asyncio.sleep(3)
 
-            except FloodWait as fw:
-                await asyncio.sleep(fw.value)
-            except RPCError as rpc_err:
+            except (FloodWait, FloodWaitError) as fw:
+                wait_sec = getattr(fw, "value", getattr(fw, "seconds", 10))
+                await asyncio.sleep(wait_sec)
+            except (RPCError, TelethonRPCError) as rpc_err:
                 error_logs.append(
                     f"• [Video #{idx} Telegram API Error]\n"
                     f"  Type: {type(rpc_err).__name__}\n"
-                    f"  Reason: {str(rpc_err)} (Check STORAGE_CHANNEL_ID & Bot Admin Rights)"
+                    f"  Reason: {str(rpc_err)} (Check STORAGE_CHANNEL_ID & Permissions)"
                 )
             except Exception as up_err:
                 error_logs.append(f"• [Video #{idx} Upload Error]\n  Reason: {type(up_err).__name__} - {str(up_err)}")
@@ -443,7 +533,7 @@ async def process_and_upload(client, user_id, html_content, hashtag):
             temp_img = f"temp_img_{user_id}_{idx}.jpg"
             await update_panel(
                 client, user_id,
-                f"⏳ **Processing Images...**\n\n"
+                f"⏳ **Processing Images via {uploader_mode}...**\n\n"
                 f"🖼️ **Progress:** `{idx}/{len(new_images)}`\n"
                 f"✅ **Videos Done:** `{uploaded_vids}` | **Images Done:** `{uploaded_imgs}`\n"
                 f"❌ **Errors Logged:** `{len(error_logs)}`"
@@ -456,16 +546,10 @@ async def process_and_upload(client, user_id, html_content, hashtag):
 
             try:
                 caption = f"🖼️ **{title}**\n\n{hashtag} #website"
-                await client.send_photo(
-                    chat_id=STORAGE_CHANNEL_ID,
-                    photo=temp_img,
-                    caption=caption
-                )
+                await upload_to_channel(temp_img, caption, is_video=False)
                 mark_as_uploaded(img_url, hashtag)
                 uploaded_imgs += 1
                 await asyncio.sleep(2)
-            except RPCError as rpc_err:
-                error_logs.append(f"• [Image #{idx} Telegram API Error]\n  Reason: {type(rpc_err).__name__} - {str(rpc_err)}")
             except Exception as up_err:
                 error_logs.append(f"• [Image #{idx} Upload Error]\n  Reason: {type(up_err).__name__} - {str(up_err)}")
             finally:
@@ -475,6 +559,7 @@ async def process_and_upload(client, user_id, html_content, hashtag):
         # ৩. চূড়ান্ত রিপোর্ট ও ইংরেজি এরর সামারি একই মেসেজে দেখানো
         summary_text = (
             f"🏁 **TASK COMPLETED REPORT**\n\n"
+            f"⚡ **Engine Used:** `{uploader_mode}`\n"
             f"📌 **Page Title:** `{title[:45]}`\n"
             f"🏷️ **Section Tag:** `{hashtag}`\n"
             f"🎬 **Videos Uploaded:** `{uploaded_vids}/{len(new_videos)}`\n"
@@ -483,7 +568,6 @@ async def process_and_upload(client, user_id, html_content, hashtag):
         )
 
         if error_logs:
-            # মেসেজ লিমিট ঠিক রাখতে সর্বোচ্চ ৮টি বিস্তারিত এরর দেখানো হবে
             joined_errors = "\n".join(error_logs[:8])
             if len(error_logs) > 8:
                 joined_errors += f"\n...and {len(error_logs) - 8} more errors."
@@ -511,7 +595,7 @@ web_app = Flask(__name__)
 
 @web_app.route("/")
 def home():
-    return "Single-Message Scraper Bot is Running!"
+    return "Telethon + Pyrogram Single-Message Scraper Bot is Running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -519,5 +603,5 @@ def run_flask():
 
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
-    print("🤖 Single-Panel Bot is starting...")
-    app.run()
+    print("🤖 Starting Hybrid (Pyrogram + Telethon) Scraper Bot...")
+    bot.run()
