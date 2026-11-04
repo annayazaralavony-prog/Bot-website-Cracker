@@ -270,7 +270,7 @@ async def custom_download(url, dest_path, state=None, progress_cb=None, max_byte
     referer_profiles = [
         {"Referer": "https://mmsdesi.me/", "Origin": "https://mmsdesi.me"},
         {"Referer": "https://www.mmsdesi.me/", "Origin": "https://www.mmsdesi.me"},
-        {f"{origin_host}/"},
+        {"Referer": f"{origin_host}/"},
         {}
     ]
 
