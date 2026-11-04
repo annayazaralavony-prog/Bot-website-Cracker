@@ -2,13 +2,14 @@ import os
 import re
 import time
 import asyncio
+import html as htmllib
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup, Tag, NavigableString
 from curl_cffi.requests import AsyncSession
 
 # ================= ওয়েবসাইট কনফিগারেশন =================
 SITE_NAME = "MMSDesi"
-HASHTAG = "#mms.desi"  # প্রতিটি অ্যালবামের ক্যাপশনের নিচে এই হ্যাশট্যাগ থাকবে
+HASHTAG = "#mmsdesi"  # প্রতিটি অ্যালবামের ক্যাপশনের নিচে এই হ্যাশট্যাগ থাকবে
 BASE_URL = "https://mmsdesi.me/"
 
 HTML_CONTENT = """
@@ -213,8 +214,15 @@ def _finalize_albums(raw_albums):
             items.append((kind, url))
         if items:
             idx = len(final) + 1
+            raw_title = a.get("title")
+            if not raw_title or not raw_title.strip():
+                raw_title = f"MMSDesi Album {idx}"
+            
+            # টাইটেল বা ক্যাপশনের সাথে নির্দিষ্ট হ্যাশট্যাগ যুক্ত করা হলো
+            final_title = f"{raw_title}\n\n{HASHTAG}"
+            
             final.append({
-                "title": a.get("title") or f"MMSDesi Album {idx}",
+                "title": final_title,
                 "items": items
             })
     return final
@@ -277,7 +285,6 @@ async def custom_download(url, dest_path, state=None, progress_cb=None, max_byte
         if state and state.get("cancel"):
             raise asyncio.CancelledError("Scan cancelled by user")
 
-        # impersonate="chrome" আসল ব্রাউজারের মতো TLS হ্যান্ডশেক করবে ফলে 403 ব্লক করবে না
         async with AsyncSession(impersonate="chrome") as session:
             response = await session.get(url, headers=headers, allow_redirects=True, timeout=300)
             
