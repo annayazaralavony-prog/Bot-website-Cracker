@@ -9,7 +9,7 @@ from curl_cffi.requests import AsyncSession
 
 # ================= ওয়েবসাইট কনফিগারেশন =================
 SITE_NAME = "MMSDesi"
-HASHTAG = "#mmsdesi"  # প্রতিটি অ্যালবামের ক্যাপশনের নিচে এই হ্যাশট্যাগ থাকবে
+HASHTAG = "#mmsdesi"  # ক্যাপশনে ব্যবহারের জন্য নির্দিষ্ট হ্যাশট্যাগ
 BASE_URL = "https://mmsdesi.me/"
 
 HTML_CONTENT = """
@@ -29,13 +29,21 @@ ALBUM_CONTAINER_RE = re.compile(
     r"album|gallery|folder|collection|post|entry|card|item-box|video-block|media-group",
     re.IGNORECASE
 )
-HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "summary"]
+TITLE_CLASS_RE = re.compile(
+    r"title|name|caption|header|heading|post-title|entry-title|video-title|desc",
+    re.IGNORECASE
+)
+IGNORE_TEXT_RE = re.compile(
+    r"^(download|watch|click here|play|video|photo|image|mp4|hd|views?|\d+[\s\w]*)$",
+    re.IGNORECASE
+)
+HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "summary", "figcaption"]
 
 
 def _normalize_url(url):
     if not url or not isinstance(url, str):
         return None
-    u = htmllib.unescape(url.strip().strip("\"'")) if 'htmllib' in globals() else url.strip().strip("\"'")
+    u = htmllib.unescape(url.strip().strip("\"'"))
     if u.startswith("//"):
         u = "https:" + u
     elif u.startswith("/"):
@@ -107,38 +115,93 @@ def iter_scope_media(scope):
 
 
 def _clean_title(text):
-    t = re.sub(r"\s+", " ", text or "").strip()
-    return t[:150] if t else None
+    if not text:
+        return None
+    t = re.sub(r"#\S+", "", str(text))
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) < 3 or IGNORE_TEXT_RE.match(t):
+        return None
+    return t[:180]
 
 
-def find_album_title(container):
+def _extract_title_from_box(box):
+    if not isinstance(box, Tag):
+        return None
+
     for sel in HEADING_TAGS:
-        h = container.find(sel)
-        if h:
+        for h in box.find_all(sel):
             t = _clean_title(h.get_text(" ", strip=True))
             if t:
                 return t
 
-    el = container.find(class_=re.compile(r"title|name|caption|header|heading", re.IGNORECASE))
-    if el:
+    for el in box.find_all(class_=TITLE_CLASS_RE):
         t = _clean_title(el.get_text(" ", strip=True))
         if t:
             return t
 
-    for attr in ("data-title", "title", "aria-label", "data-name"):
-        val = container.get(attr)
-        if isinstance(val, str) and _clean_title(val):
-            return _clean_title(val)
+    for attr in ("data-title", "title", "aria-label", "data-name", "alt"):
+        val = box.get(attr)
+        if isinstance(val, str):
+            t = _clean_title(val)
+            if t:
+                return t
+
+    for p in box.find_all(["p", "strong", "b"]):
+        t = _clean_title(p.get_text(" ", strip=True))
+        if t:
+            return t
+
+    for media_tag in box.find_all(["a", "video", "img"]):
+        for attr in ("data-title", "title", "alt", "aria-label"):
+            val = media_tag.get(attr)
+            if isinstance(val, str):
+                t = _clean_title(val)
+                if t:
+                    return t
+        if media_tag.name == "a":
+            t = _clean_title(media_tag.get_text(" ", strip=True))
+            if t:
+                return t
+
+    return None
+
+
+def find_album_title(container):
+    t = _extract_title_from_box(container)
+    if t:
+        return t
 
     sib = container.find_previous_sibling()
-    for _ in range(2):
+    for _ in range(3):
         if not sib:
             break
-        if sib.name in HEADING_TAGS:
-            t = _clean_title(sib.get_text(" ", strip=True))
+        if sib.name in HEADING_TAGS or sib.name in ("p", "header", "div", "strong", "span"):
+            t = _extract_title_from_box(sib) or _clean_title(sib.get_text(" ", strip=True))
             if t:
                 return t
         sib = sib.find_previous_sibling()
+
+    parent = container.parent
+    for _ in range(3):
+        if not parent or parent.name in ("body", "html", "[document]"):
+            break
+        for sel in HEADING_TAGS + ["header"]:
+            h = parent.find(sel, recursive=False)
+            if h:
+                t = _clean_title(h.get_text(" ", strip=True))
+                if t:
+                    return t
+        el = parent.find(class_=TITLE_CLASS_RE, recursive=False)
+        if el:
+            t = _clean_title(el.get_text(" ", strip=True))
+            if t:
+                return t
+        psib = parent.find_previous_sibling()
+        if psib and psib.name in HEADING_TAGS + ["p", "header", "strong"]:
+            t = _clean_title(psib.get_text(" ", strip=True))
+            if t:
+                return t
+        parent = parent.parent
 
     return None
 
@@ -147,20 +210,38 @@ def _strategy_containers(soup):
     candidates = []
     for t in soup.find_all(["article", "section", "div", "li", "details", "figure"]):
         cid = " ".join(t.get("class") or []) + " " + (t.get("id") or "")
-        if t.name == "article" or ALBUM_CONTAINER_RE.search(cid):
+        if t.name in ("article", "figure") or ALBUM_CONTAINER_RE.search(cid):
             candidates.append(t)
 
     with_media = []
     for t in candidates:
-        items = list(iter_scope_media(t))
+        items = list(dict.fromkeys(iter_scope_media(t)))
         if items:
             with_media.append((t, items))
 
-    all_ids = {id(t) for t, _ in with_media}
+    item_map = {id(t): items for t, items in with_media}
+    all_ids = set(item_map.keys())
+
     albums = []
     for t, items in with_media:
-        if t.find(lambda child: child is not t and id(child) in all_ids):
+        child_with_different_media = t.find(
+            lambda child: child is not t
+            and id(child) in all_ids
+            and len(item_map[id(child)]) < len(items)
+        )
+        if child_with_different_media:
             continue
+
+        parent_same_media = False
+        p = t.parent
+        while p:
+            if id(p) in all_ids and len(item_map[id(p)]) == len(items):
+                parent_same_media = True
+                break
+            p = p.parent
+        if parent_same_media:
+            continue
+
         albums.append({
             "title": find_album_title(t),
             "items": items
@@ -173,19 +254,25 @@ def _strategy_headings(soup):
     current_album = None
     root = soup.body or soup
 
+    has_headings = bool(root.find(HEADING_TAGS))
+    caption_tags = set(HEADING_TAGS) if has_headings else set(HEADING_TAGS + ["p", "strong"])
+
     for node in root.descendants:
         if isinstance(node, Tag):
-            if node.name in HEADING_TAGS:
+            if node.name in caption_tags:
                 title_text = _clean_title(node.get_text(" ", strip=True))
                 if title_text:
-                    current_album = {"title": title_text, "items": []}
-                    albums.append(current_album)
+                    if current_album is not None and not current_album["items"]:
+                        current_album["title"] = title_text
+                    else:
+                        current_album = {"title": title_text, "items": []}
+                        albums.append(current_album)
                 continue
 
             res = classify_node(node)
             if res and res[1]:
                 if current_album is None:
-                    current_album = {"title": "Album 1", "items": []}
+                    current_album = {"title": None, "items": []}
                     albums.append(current_album)
                 current_album["items"].append(res)
 
@@ -195,14 +282,14 @@ def _strategy_headings(soup):
                     u = _normalize_url(m)
                     if u:
                         if current_album is None:
-                            current_album = {"title": "Album 1", "items": []}
+                            current_album = {"title": None, "items": []}
                             albums.append(current_album)
                         current_album["items"].append(("video", u))
 
     return albums
 
 
-def _finalize_albums(raw_albums):
+def _finalize_albums(raw_albums, default_title=""):
     final = []
     for a in raw_albums:
         seen = set()
@@ -213,16 +300,11 @@ def _finalize_albums(raw_albums):
             seen.add(url)
             items.append((kind, url))
         if items:
-            idx = len(final) + 1
-            raw_title = a.get("title")
-            if not raw_title or not raw_title.strip():
-                raw_title = f"MMSDesi Album {idx}"
-            
-            # টাইটেল বা ক্যাপশনের সাথে নির্দিষ্ট হ্যাশট্যাগ যুক্ত করা হলো
-            final_title = f"{raw_title}\n\n{HASHTAG}"
-            
+            raw_title = _clean_title(a.get("title")) or default_title or ""
+            # শুধুমাত্র একটি হ্যাশট্যাগ নিশ্চিত করার জন্য
+            clean_tag = HASHTAG.strip()
             final.append({
-                "title": final_title,
+                "title": f"{raw_title}\n\n{clean_tag}" if raw_title else clean_tag,
                 "items": items
             })
     return final
@@ -234,22 +316,34 @@ def extract_albums(html_content):
         return SITE_NAME, []
 
     soup = BeautifulSoup(html_text, "html.parser")
-    page_title = soup.title.string.strip() if soup.title and soup.title.string else SITE_NAME
 
-    by_containers = _finalize_albums(_strategy_containers(soup))
-    by_headings = _finalize_albums(_strategy_headings(soup))
+    page_title = None
+    og_title = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
+    if og_title and og_title.get("content"):
+        page_title = _clean_title(og_title["content"])
+    if not page_title and soup.find("h1"):
+        page_title = _clean_title(soup.find("h1").get_text(" ", strip=True))
+    if not page_title and soup.title and soup.title.string:
+        page_title = _clean_title(soup.title.string)
+    page_title = page_title or ""
 
-    if len(by_containers) >= 2 and len(by_containers) >= len(by_headings):
-        return page_title, by_containers
+    by_containers = _finalize_albums(_strategy_containers(soup), default_title=page_title)
+    by_headings = _finalize_albums(_strategy_headings(soup), default_title=page_title)
+
+    def _titled_count(alb_list):
+        return sum(1 for x in alb_list if x["title"])
+
+    if len(by_containers) >= 2 and _titled_count(by_containers) >= _titled_count(by_headings):
+        return page_title or SITE_NAME, by_containers
     if len(by_headings) >= 2:
-        return page_title, by_headings
+        return page_title or SITE_NAME, by_headings
     if by_containers:
-        return page_title, by_containers
+        return page_title or SITE_NAME, by_containers
     if by_headings:
-        return page_title, by_headings
+        return page_title or SITE_NAME, by_headings
 
     all_items = list(iter_scope_media(soup))
-    return page_title, _finalize_albums([{"title": page_title, "items": all_items}])
+    return page_title or SITE_NAME, _finalize_albums([{"title": page_title, "items": all_items}], default_title=page_title)
 
 
 # ================= curl_cffi দিয়ে Cloudflare ও 403 বাইপাস ডাউনলোডার =================
@@ -287,7 +381,7 @@ async def custom_download(url, dest_path, state=None, progress_cb=None, max_byte
 
         async with AsyncSession(impersonate="chrome") as session:
             response = await session.get(url, headers=headers, allow_redirects=True, timeout=300)
-            
+
             if response.status_code != 200:
                 return False, f"HTTP Error {response.status_code} - Server blocked."
 
