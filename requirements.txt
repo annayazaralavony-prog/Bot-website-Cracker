@@ -1,5 +1,6 @@
 pyrogram
 tgcrypto
-beautifulsoup4
+telethon
 aiohttp
+beautifulsoup4
 flask
