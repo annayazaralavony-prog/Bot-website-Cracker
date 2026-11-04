@@ -52,6 +52,52 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
 STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", "-100123456789"))
 TELETHON_SESSION_STRING = os.environ.get("TELETHON_SESSION_STRING", "").strip()
 
+# ---- [NEW] একাধিক অ্যাকাউন্ট (Album-level Concurrency) ----
+# অতিরিক্ত অ্যাকাউন্ট দিতে: TELETHON_SESSION_STRING_2, TELETHON_SESSION_STRING_3 ... (৯ পর্যন্ত)
+# অথবা কমা দিয়ে আলাদা করে: TELETHON_SESSION_STRINGS="sess1,sess2,sess3"
+def _collect_session_strings():
+    found = []
+    if TELETHON_SESSION_STRING:
+        found.append(TELETHON_SESSION_STRING)
+    for raw in os.environ.get("TELETHON_SESSION_STRINGS", "").split(","):
+        raw = raw.strip()
+        if raw:
+            found.append(raw)
+    for n in range(2, 10):
+        raw = os.environ.get(f"TELETHON_SESSION_STRING_{n}", "").strip()
+        if raw:
+            found.append(raw)
+    unique = []
+    for s in found:
+        if s not in unique:
+            unique.append(s)
+    return unique
+
+# ---- [NEW] Pyrogram User Session Strings (আপলোডার অ্যাকাউন্ট) ----
+# PYROGRAM_SESSION_STRING (অ্যাকাউন্ট ১), PYROGRAM_SESSION_STRING_2 ... _9
+# অথবা কমা দিয়ে: PYROGRAM_SESSION_STRINGS="sess1,sess2,sess3"
+def _collect_pyro_sessions():
+    found = []
+    first = os.environ.get("PYROGRAM_SESSION_STRING", "").strip()
+    if first:
+        found.append(first)
+    for raw in os.environ.get("PYROGRAM_SESSION_STRINGS", "").split(","):
+        raw = raw.strip()
+        if raw:
+            found.append(raw)
+    for n in range(2, 10):
+        raw = os.environ.get(f"PYROGRAM_SESSION_STRING_{n}", "").strip()
+        if raw:
+            found.append(raw)
+    unique = []
+    for x in found:
+        if x not in unique:
+            unique.append(x)
+    return unique
+
+# একটি অ্যালবামের ভেতরে একসাথে কয়টি ফাইল প্যারালাল ডাউনলোড হবে
+DOWNLOAD_PARALLEL = max(1, int(os.environ.get("DOWNLOAD_PARALLEL", "5")))
+
 SITES_DIR = "sites"  # গিটহাবে এই ফোল্ডারে সাইটের ফাইলগুলো রাখবেন (অথবা রুট ফোল্ডারে)
 DB_PATH = "scraped_data.db"
 BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID") or STORAGE_CHANNEL_ID)
@@ -64,9 +110,21 @@ MAX_BATCH_BYTES = int(os.environ.get("MAX_BATCH_MB", "1200")) * 1024 * 1024
 
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-telethon_client = None
-if TELETHON_AVAILABLE and TELETHON_SESSION_STRING:
-    telethon_client = TelegramClient(StringSession(TELETHON_SESSION_STRING), API_ID, API_HASH)
+# Pyrogram User Session ক্লায়েন্টগুলো (আপলোডার অ্যাকাউন্ট)
+pyro_clients = []
+for _i, _sess in enumerate(_collect_pyro_sessions(), start=1):
+    pyro_clients.append(Client(
+        f"uploader_acc_{_i}", api_id=API_ID, api_hash=API_HASH,
+        session_string=_sess, in_memory=True
+    ))
+pyro_ready = []  # সফলভাবে স্টার্ট হওয়া ক্লায়েন্ট: [(নাম, client)]
+
+# প্রথম ক্লায়েন্ট (telethon_client) আগের মতোই ব্যাকআপ রিস্টোর/চ্যানেল সিঙ্কে ব্যবহার হয়
+telethon_clients = []
+if TELETHON_AVAILABLE:
+    for _sess in _collect_session_strings():
+        telethon_clients.append(TelegramClient(StringSession(_sess), API_ID, API_HASH))
+telethon_client = telethon_clients[0] if telethon_clients else None
 
 # ================= ডাটাবেস =================
 conn = None
@@ -235,7 +293,7 @@ def mark_as_uploaded(url, hashtag):
 loaded_sites = {}  # key -> {"key", "name", "hashtag", "module", "path"}
 
 def discover_sites():
-    """গিটহাব রিপোজিটরির sites/ ফোল্ডার বা রুট ফোল্ডার থেকে সব ওয়েবসাইট স্ক্রিপ্ট লোড করে"""
+    """গিটহাব রিপোজিটরির sites/ ফোল্ডার বা রুট ফোল্ডার থেকে সব ওয়েবসাইট স্ক্রিপ্ট লোড করে"""
     global loaded_sites
     loaded_sites = {}
     os.makedirs(SITES_DIR, exist_ok=True)
@@ -285,7 +343,7 @@ def find_site_by_label(label):
     return None
 
 def get_site_albums(site, override_html=None):
-    """নির্দিষ্ট ওয়েবসাইটের ফাইল থেকে অ্যালবাম ও ভিডিও লিস্ট বের করে আনে"""
+    """নির্দিষ্ট ওয়েবসাইটের ফাইল থেকে অ্যালবাম ও ভিডিও লিস্ট বের করে আনে"""
     mod = site["module"]
     html_content = override_html if override_html is not None else getattr(mod, "HTML_CONTENT", "")
 
@@ -393,15 +451,17 @@ async def reset_panel(client, user_id):
             pass
     session["panel_msg_id"] = None
 
-async def ensure_telethon_connected():
+async def ensure_telethon_connected(tclient=None):
+    """tclient না দিলে প্রথম Telethon ক্লায়েন্ট চেক করবে (আগের মতোই)"""
     if not TELETHON_AVAILABLE:
         return False, "Telethon not installed."
-    if not telethon_client:
+    target = tclient if tclient is not None else telethon_client
+    if not target:
         return False, "TELETHON_SESSION_STRING missing."
     try:
-        if not telethon_client.is_connected():
-            await telethon_client.connect()
-        if not await telethon_client.is_user_authorized():
+        if not target.is_connected():
+            await target.connect()
+        if not await target.is_user_authorized():
             return False, "Telethon Session String invalid/expired."
         return True, "Connected"
     except Exception as e:
@@ -488,6 +548,8 @@ async def start_cmd(client, message):
 
     t_ok, t_status = await ensure_telethon_connected()
     engine_status = "🟢 Active (Telethon Session)" if t_ok else f"🔴 Inactive ({t_status})"
+    if t_ok and len(telethon_clients) > 1:
+        engine_status = f"🟢 Active (Telethon x{len(telethon_clients)} Accounts)"
     sites_list = "\n".join(f"• `{s['name']}` (`{s['path']}`)" for s in loaded_sites.values()) or "• `No site files found in sites/ folder`"
 
     welcome_text = (
@@ -495,7 +557,7 @@ async def start_cmd(client, message):
         f"⚡ **Telethon Engine:** `{engine_status}`\n"
         f"📦 **Storage Channel:** `{STORAGE_CHANNEL_ID}`\n\n"
         f"📂 **Loaded Website Modules ({len(loaded_sites)}):**\n{sites_list}\n\n"
-        "নিচের মেনু কিবোর্ড থেকে যেকোনো ওয়েবসাইট সিলেক্ট করে স্ক্যান শুরু করুন:"
+        "নিচের মেনু কিবোর্ড থেকে যেকোনো ওয়েবসাইট সিলেক্ট করে স্ক্যান শুরু করুন:"
     )
     await reset_panel(client, user_id)
     await refresh_menu(client, user_id)
@@ -531,6 +593,8 @@ async def handle_callbacks(client, cq):
 
             t_ok, t_status = await ensure_telethon_connected()
             engine_status = "🟢 Active (Telethon Session)" if t_ok else f"🔴 Inactive ({t_status})"
+            if t_ok and len(telethon_clients) > 1:
+                engine_status = f"🟢 Active (Telethon x{len(telethon_clients)} Accounts)"
             sites_list = "\n".join(f"• `{s['name']}` (`{s['path']}`)" for s in loaded_sites.values()) or "• `No site files found in sites/ folder`"
             await update_panel(
                 client, user_id,
@@ -573,7 +637,7 @@ async def handle_callbacks(client, cq):
                 client, user_id,
                 f"📄 **Send HTML for `{safe(site['name'])}`**\n\n"
                 f"এখন এই সাইটের `.html` ফাইল আপলোড করুন অথবা কোড পেস্ট করুন।\n"
-                f"*(বট `{site['path']}` ফাইলের নিয়ম অনুযায়ী ভিডিও ও অ্যালবাম খুঁজে বের করবে)*",
+                f"*(বট `{site['path']}` ফাইলের নিয়ম অনুযায়ী ভিডিও ও অ্যালবাম খুঁজে বের করবে)*",
                 InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"site_back_{site_key}")]])
             )
 
@@ -658,7 +722,7 @@ async def handle_document_input(client, message):
             await message.delete()
         except Exception:
             pass
-        await update_panel(client, user_id, "⚠️ আগে নিচের মেনু থেকে একটি ওয়েবসাইট বাটন সিলেক্ট করুন, তারপর HTML ফাইল দিন।", get_home_keyboard())
+        await update_panel(client, user_id, "⚠️ আগে নিচের মেনু থেকে একটি ওয়েবসাইট বাটন সিলেক্ট করুন, তারপর HTML ফাইল দিন।", get_home_keyboard())
         return
 
     file_path = None
@@ -722,7 +786,7 @@ def url_ext(url, kind):
     return ".mp4" if kind == "video" else ".jpg"
 
 def build_request_headers(url, site_mod):
-    """ওয়েবসাইটের ফাইলে কাস্টম হেডার বা রেফারার থাকলে সেটি ব্যবহার করবে"""
+    """ওয়েবসাইটের ফাইলে কাস্টম হেডার বা রেফারার থাকলে সেটি ব্যবহার করবে"""
     parsed = urlparse(url)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -794,20 +858,31 @@ def build_caption(title, a_idx, total_albums, part, multi_part, hashtag):
     cap += f"\n{htmllib.escape(hashtag)}"
     return cap
 
-async def send_album(files, caption):
-    t_ok, _ = await ensure_telethon_connected()
+# ---- [CHANGED] uploader = {"type": "telethon"/"pyrogram", "client": ..., "name": ...}
+# প্রতিটি অ্যালবাম একটিমাত্র uploader (অ্যাকাউন্ট) দিয়েই সম্পূর্ণ আপলোড হবে ----
+async def send_album(files, caption, uploader=None):
+    tclient = None
+    if uploader and uploader.get("type") == "telethon":
+        t_ok, _ = await ensure_telethon_connected(uploader["client"])
+        if t_ok:
+            tclient = uploader["client"]
+    elif uploader is None:
+        t_ok, _ = await ensure_telethon_connected()
+        if t_ok:
+            tclient = telethon_client
     paths = [f["path"] for f in files]
+    pc = uploader["client"] if (uploader and uploader.get("type") == "pyrogram") else bot
 
-    if t_ok:
+    if tclient is not None:
         if len(paths) == 1:
-            await telethon_client.send_file(
+            await tclient.send_file(
                 STORAGE_CHANNEL_ID, paths[0],
                 caption=caption or None, parse_mode="html",
                 supports_streaming=(files[0]["kind"] == "video")
             )
         else:
             caps = [caption] + [""] * (len(paths) - 1)
-            await telethon_client.send_file(
+            await tclient.send_file(
                 STORAGE_CHANNEL_ID, paths,
                 caption=caps, parse_mode="html",
                 supports_streaming=True
@@ -816,12 +891,12 @@ async def send_album(files, caption):
         if len(files) == 1:
             f = files[0]
             if f["kind"] == "video":
-                await bot.send_video(
+                await pc.send_video(
                     STORAGE_CHANNEL_ID, video=f["path"], caption=caption,
                     parse_mode=enums.ParseMode.HTML, supports_streaming=True
                 )
             else:
-                await bot.send_photo(
+                await pc.send_photo(
                     STORAGE_CHANNEL_ID, photo=f["path"], caption=caption,
                     parse_mode=enums.ParseMode.HTML
                 )
@@ -833,32 +908,33 @@ async def send_album(files, caption):
                     media.append(InputMediaVideo(f["path"], caption=cap, parse_mode=enums.ParseMode.HTML, supports_streaming=True))
                 else:
                     media.append(InputMediaPhoto(f["path"], caption=cap, parse_mode=enums.ParseMode.HTML))
-            await bot.send_media_group(STORAGE_CHANNEL_ID, media)
+            await pc.send_media_group(STORAGE_CHANNEL_ID, media)
 
-async def send_with_flood_retry(files, caption, state):
+async def send_with_flood_retry(files, caption, state, uploader=None):
     for _ in range(3):
         try:
-            await run_cancellable(send_album(files, caption), state)
+            await run_cancellable(send_album(files, caption, uploader), state)
             return
         except (FloodWait, FloodWaitError) as fw:
             wait_sec = int(getattr(fw, "value", getattr(fw, "seconds", 10)) or 10)
             await cancellable_sleep(min(wait_sec + 1, 600), state)
     raise RuntimeError("Too many FloodWait retries")
 
-async def send_batch(files, caption, state):
+async def send_batch(files, caption, state, uploader=None):
     try:
-        await send_with_flood_retry(files, caption, state)
+        await send_with_flood_retry(files, caption, state, uploader)
         return list(files), []
     except ScanCancelled:
         raise
     except Exception as first_err:
         if len(files) == 1:
             return [], [(files[0]["url"], f"{type(first_err).__name__}: {first_err}")]
+        # ফলব্যাক: একই uploader দিয়েই ফাইলগুলো সিরিয়াল অনুযায়ী একটা একটা করে পাঠানো হবে
         ok_files, failed = [], []
         captioned = False
         for f in files:
             try:
-                await send_with_flood_retry([f], "" if captioned else caption, state)
+                await send_with_flood_retry([f], "" if captioned else caption, state, uploader)
                 captioned = True
                 ok_files.append(f)
             except ScanCancelled:
@@ -867,10 +943,10 @@ async def send_batch(files, caption, state):
                 failed.append((f["url"], f"{type(e).__name__}: {e}"))
         return ok_files, failed
 
-async def upload_album_batch(batch, title, a_idx, total_albums, part, multi_part, hashtag, state):
+async def upload_album_batch(batch, title, a_idx, total_albums, part, multi_part, hashtag, state, uploader=None):
     caption = build_caption(title, a_idx, total_albums, part, multi_part, hashtag)
     try:
-        ok_files, failed = await send_batch(batch, caption, state)
+        ok_files, failed = await send_batch(batch, caption, state, uploader)
     finally:
         for f in batch:
             if os.path.exists(f["path"]):
@@ -905,6 +981,19 @@ async def start_scan(client, user_id, site, override_html=None):
     active_scans[user_id] = state
     return True
 
+async def build_uploaders():
+    """প্রতিটি রেডি অ্যাকাউন্ট (Pyrogram User / Telethon) একটি করে worker। কিছু না থাকলে Pyrogram বট।"""
+    uploaders = []
+    for name, c in pyro_ready:
+        uploaders.append({"type": "pyrogram", "client": c, "name": name})
+    for i, c in enumerate(telethon_clients, start=1):
+        ok, _ = await ensure_telethon_connected(c)
+        if ok:
+            uploaders.append({"type": "telethon", "client": c, "name": f"Telethon {i}"})
+    if not uploaders:
+        uploaders.append({"type": "pyrogram", "client": bot, "name": "Bot Token"})
+    return uploaders
+
 async def process_and_upload(client, user_id, site, override_html=None, state=None):
     if state is None:
         state = {"cancel": False}
@@ -921,17 +1010,39 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
     title = site["name"]
     total_albums = 0
     uploader_mode = "Pyrogram Bot Token"
-    ctx = {"a_idx": 0, "title": ""}
+    workers = {}  # wid -> {"name", "a_idx", "title", "action", "bytes"}
+    last_panel = [0.0]
 
-    def progress_text(action, extra=""):
+    def progress_text(header_action="", extra=""):
+        lines = []
+        for wid in sorted(workers):
+            ws = workers[wid]
+            if not ws.get("a_idx"):
+                continue
+            mb = sum(ws.get("bytes", {}).values()) // (1024 * 1024)
+            mb_txt = f" | 📦 `{mb} MB`" if mb else ""
+            lines.append(
+                f"👤 `{ws['name']}` → 📁 `{ws['a_idx']}/{total_albums}` `{safe(ws['title'])[:28]}`\n"
+                f"   {ws['action']}{mb_txt}"
+            )
+        body = "\n".join(lines) if lines else header_action
         return (
             f"⏳ **Scanning `{safe(site['name'])}`**\n\n"
             f"⚡ **Engine:** `{uploader_mode}`\n"
-            f"📁 **Album:** `{ctx['a_idx']}/{total_albums}` - `{safe(ctx['title'])[:40]}`\n"
-            f"{action}\n"
+            f"{body}\n"
             f"{extra}"
-            f"✅ **Uploaded:** `{up_v} videos, {up_p} photos` | ❌ **Failed:** `{len(errors)}`"
+            f"✅ **Uploaded:** `{up_v} videos, {up_p} photos` | ❌ **Failed:** `{len(errors)}` | 📁 **Albums Done:** `{albums_done}/{total_albums}`"
         )
+
+    async def refresh(force=False):
+        now = time.monotonic()
+        if not force and now - last_panel[0] < 3:
+            return
+        last_panel[0] = now
+        try:
+            await update_panel(client, user_id, progress_text(), cancel_kb)
+        except Exception:
+            pass
 
     try:
         await update_panel(client, user_id, f"🔍 **Running parser `{site['path']}`...**", cancel_kb)
@@ -948,15 +1059,18 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             )
             return
 
-        t_ok, _ = await ensure_telethon_connected()
-        uploader_mode = "Telethon User Session" if t_ok else "Pyrogram Bot Token"
+        uploaders = await build_uploaders()
+        if uploaders[0]["name"] == "Bot Token":
+            uploader_mode = "Pyrogram Bot Token"
+        elif len(uploaders) == 1:
+            uploader_mode = f"{uploaders[0]['name']} (User Session)"
+        else:
+            uploader_mode = f"{len(uploaders)} User Accounts (Album-level parallel)"
+
+        # ---------- ধাপ ১: সব অ্যালবামের জব তৈরি (ডুপ্লিকেট ফিল্টার, সিরিয়াল ঠিক রেখে) ----------
         seen_run = set()
-
+        queue = asyncio.Queue()
         for a_idx, album in enumerate(albums, start=1):
-            check_cancel(state)
-            ctx["a_idx"] = a_idx
-            ctx["title"] = album["title"]
-
             all_items = album["items"]
             v_found = sum(1 for k, _ in all_items if k == "video")
             p_found = len(all_items) - v_found
@@ -978,98 +1092,155 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
 
             if not items:
                 continue
+            queue.put_nowait({
+                "a_idx": a_idx, "album": album, "items": items, "all_items": all_items,
+                "v_found": v_found, "p_found": p_found, "prev_v": prev_v, "prev_p": prev_p
+            })
 
-            batch = []
-            batch_bytes = 0
-            part = 0
+        # ---------- ধাপ ২: একটি অ্যালবাম = একটি অ্যাকাউন্ট, সম্পূর্ণ সিরিয়ালি ----------
+        async def process_album(job, uploader, wid):
+            nonlocal up_v, up_p, albums_done
+            a_idx = job["a_idx"]
+            album = job["album"]
+            items = job["items"]
+            all_items = job["all_items"]
+            ws = workers[wid]
+            ws.update({"a_idx": a_idx, "title": album["title"], "action": "⏳ Starting...", "bytes": {}})
+
             a_up_v = a_up_p = a_fail = 0
+            part = 0
+            sem = asyncio.Semaphore(DOWNLOAD_PARALLEL)
 
-            async def flush(batch_list, part_no):
-                mb = sum(f["size"] for f in batch_list) // (1024 * 1024)
-                await update_panel(
-                    client, user_id,
-                    progress_text(f"⬆️ **Uploading Album Part {part_no}:** `{len(batch_list)} files, {mb} MB`"),
-                    cancel_kb
-                )
-                ok_files, failed = await upload_album_batch(
-                    batch_list, album["title"], a_idx, total_albums, part_no,
-                    len(items) > MAX_ALBUM_BATCH or part_no > 1, hashtag, state
-                )
-                return tally(ok_files, failed, a_idx)
+            async def dl_one(item_idx, kind, url):
+                label = "Video" if kind == "video" else "Photo"
+                temp = f"tmp_{user_id}_{a_idx}_{item_idx}{url_ext(url, kind)}"
+
+                async def progress(downloaded, total):
+                    ws["bytes"][item_idx] = downloaded
+                    await refresh()
+
+                async with sem:
+                    try:
+                        check_cancel(state)
+                        ok, err = await download_file_with_details(url, temp, site_mod, state, progress, MAX_FILE_BYTES)
+                    except ScanCancelled:
+                        return {"cancelled": True, "ok": False}
+                ws["bytes"].pop(item_idx, None)
+                if not ok:
+                    if os.path.exists(temp):
+                        os.remove(temp)
+                    return {
+                        "ok": False,
+                        "err": f"• [Album {a_idx} {label} #{item_idx} Failed]\n  URL: {url[:45]}...\n  Reason: {err}"
+                    }
+                size = os.path.getsize(temp)
+                return {"ok": True, "file": {"path": temp, "kind": kind, "url": url, "size": size}}
 
             try:
-                for item_idx, (kind, url) in enumerate(items, start=1):
+                for start in range(0, len(items), MAX_ALBUM_BATCH):
                     check_cancel(state)
-                    label = "Video" if kind == "video" else "Photo"
-                    temp = f"tmp_{user_id}_{a_idx}_{item_idx}{url_ext(url, kind)}"
+                    chunk = items[start:start + MAX_ALBUM_BATCH]
+                    ws["action"] = f"⬇️ Downloading `{start + 1}-{start + len(chunk)}/{len(items)}` (parallel x{min(DOWNLOAD_PARALLEL, len(chunk))})"
+                    await refresh(force=True)
 
-                    await update_panel(
-                        client, user_id,
-                        progress_text(
-                            f"⬇️ **Downloading {label}:** `{item_idx}/{len(items)}`",
-                            f"🔗 `{safe(url[:50])}...`\n"
-                        ),
-                        cancel_kb
-                    )
+                    # অ্যালবামের ভেতরে প্যারালাল ডাউনলোড - gather রেজাল্ট ইনপুট সিরিয়ালেই ফেরত দেয়
+                    results = await asyncio.gather(*[
+                        dl_one(start + off + 1, kind, url)
+                        for off, (kind, url) in enumerate(chunk)
+                    ])
+                    if any(r.get("cancelled") for r in results):
+                        raise ScanCancelled()
+                    check_cancel(state)
 
-                    async def progress(downloaded, total):
-                        pct = f" ({downloaded * 100 // total}%)" if total else ""
-                        size_txt = f"{downloaded // (1024 * 1024)} MB" + (f" / {total // (1024 * 1024)} MB" if total else "")
-                        await update_panel(
-                            client, user_id,
-                            progress_text(
-                                f"⬇️ **Downloading {label}:** `{item_idx}/{len(items)}`",
-                                f"📦 `{size_txt}{pct}`\n"
-                            ),
-                            cancel_kb
-                        )
+                    downloaded_files = []
+                    for r in results:
+                        if r["ok"]:
+                            downloaded_files.append(r["file"])
+                        else:
+                            errors.append(r["err"])
+                            a_fail += 1
 
-                    ok, err = await download_file_with_details(url, temp, site_mod, state, progress, MAX_FILE_BYTES)
-                    if not ok:
-                        errors.append(f"• [Album {a_idx} {label} #{item_idx} Failed]\n  URL: {url[:45]}...\n  Reason: {err}")
-                        a_fail += 1
-                        if os.path.exists(temp):
-                            os.remove(temp)
-                        continue
+                    # সাইজ লিমিট অনুযায়ী ভাগ (সিরিয়াল অপরিবর্তিত)
+                    groups, cur, cur_bytes = [], [], 0
+                    for f in downloaded_files:
+                        if cur and cur_bytes + f["size"] > MAX_BATCH_BYTES:
+                            groups.append(cur)
+                            cur, cur_bytes = [], 0
+                        cur.append(f)
+                        cur_bytes += f["size"]
+                    if cur:
+                        groups.append(cur)
 
-                    size = os.path.getsize(temp)
-                    batch.append({"path": temp, "kind": kind, "url": url, "size": size})
-                    batch_bytes += size
-
-                    if len(batch) >= MAX_ALBUM_BATCH or batch_bytes >= MAX_BATCH_BYTES:
+                    # আপলোড: একই অ্যাকাউন্টে, একটার পর একটা পার্ট
+                    for g in groups:
+                        check_cancel(state)
                         part += 1
-                        to_send = batch
-                        batch = []
-                        batch_bytes = 0
-                        v, p, errs = await flush(to_send, part)
+                        mb = sum(f["size"] for f in g) // (1024 * 1024)
+                        ws["action"] = f"⬆️ Uploading Part `{part}`: `{len(g)} files, {mb} MB`"
+                        ws["bytes"] = {}
+                        await refresh(force=True)
+                        multi = len(items) > MAX_ALBUM_BATCH or part > 1
+                        ok_files, failed = await upload_album_batch(
+                            g, album["title"], a_idx, total_albums, part, multi, hashtag, state, uploader
+                        )
+                        v, p, errs = tally(ok_files, failed, a_idx)
                         a_up_v += v; a_up_p += p; up_v += v; up_p += p
                         a_fail += len(errs); errors.extend(errs)
-                        await cancellable_sleep(2, state)
-
-                if batch:
-                    part += 1
-                    to_send = batch
-                    batch = []
-                    v, p, errs = await flush(to_send, part)
-                    a_up_v += v; a_up_p += p; up_v += v; up_p += p
-                    a_fail += len(errs); errors.extend(errs)
+                        await cancellable_sleep(1, state)
             finally:
-                for f in batch:
-                    if os.path.exists(f["path"]):
-                        os.remove(f["path"])
+                for fn in glob.glob(f"tmp_{user_id}_{a_idx}_*"):
+                    try:
+                        os.remove(fn)
+                    except Exception:
+                        pass
 
             report = (
                 f"✅ <b>Album {a_idx}/{total_albums} completed</b>\n"
                 f"📁 {htmllib.escape(album['title'][:200])}\n"
-                f"🎬 Videos: {a_up_v + prev_v}/{v_found}\n"
-                f"🖼️ Photos: {a_up_p + prev_p}/{p_found}\n"
+                f"🎬 Videos: {a_up_v + job['prev_v']}/{job['v_found']}\n"
+                f"🖼️ Photos: {a_up_p + job['prev_p']}/{job['p_found']}\n"
                 f"📦 Total files in album: {len(all_items)}"
             )
             if a_fail:
                 report += f"\n⚠️ Failed: {a_fail}"
             await send_channel_text(report)
             albums_done += 1
-            await cancellable_sleep(2, state)
+            ws.update({"a_idx": 0, "action": "✅ Idle", "bytes": {}})
+            await refresh(force=True)
+            await cancellable_sleep(1, state)
+
+        async def worker(wid, uploader):
+            workers[wid] = {"name": uploader["name"], "a_idx": 0, "title": "", "action": "", "bytes": {}}
+            while True:
+                check_cancel(state)
+                try:
+                    job = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    await process_album(job, uploader, wid)
+                except ScanCancelled:
+                    raise
+                except Exception as album_err:
+                    errors.append(
+                        f"• [Album {job['a_idx']} Crashed]\n  Reason: {type(album_err).__name__}: {album_err}"
+                    )
+                    workers[wid].update({"a_idx": 0, "bytes": {}})
+
+        tasks = [asyncio.create_task(worker(i, u)) for i, u in enumerate(uploaders)]
+        try:
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            for t in tasks:
+                t.cancel()
+            raise
+        for out in outcomes:
+            if isinstance(out, ScanCancelled):
+                cancelled = True
+            elif isinstance(out, BaseException) and not isinstance(out, asyncio.CancelledError):
+                raise out
+        if state.get("cancel"):
+            cancelled = True
 
     except ScanCancelled:
         cancelled = True
@@ -1133,15 +1304,37 @@ async def main():
         status = f"Restore error: {e}"
     print(f"💾 {status}")
 
+    # Pyrogram User Session আপলোডার অ্যাকাউন্ট স্টার্ট
+    for i, pc in enumerate(pyro_clients, start=1):
+        try:
+            await pc.start()
+            me = await pc.get_me()
+            try:
+                await pc.get_chat(STORAGE_CHANNEL_ID)
+            except Exception:
+                # in_memory সেশনে চ্যানেল পিয়ার ক্যাশ করতে ডায়ালগ লোড করা হয়
+                async for _d in pc.get_dialogs():
+                    pass
+                await pc.get_chat(STORAGE_CHANNEL_ID)
+            pyro_ready.append((f"Account {i}", pc))
+            print(f"👤 Uploader Account {i} ready: {me.first_name} ({me.id})")
+        except Exception as e:
+            print(f"⚠️ Uploader Account {i} failed to start: {type(e).__name__}: {e}")
+
     backup_event = asyncio.Event()
     worker = asyncio.create_task(backup_worker())
-    print(f"🤖 Bot is running. Loaded {len(loaded_sites)} site modules.")
+    print(f"🤖 Bot is running. Loaded {len(loaded_sites)} site modules. Pyrogram uploader accounts: {len(pyro_ready)} | Telethon accounts: {len(telethon_clients)}")
 
     await idle()
 
     worker.cancel()
     if backup_dirty:
         await do_backup()
+    for _n, pc in pyro_ready:
+        try:
+            await pc.stop()
+        except Exception:
+            pass
     await bot.stop()
 
 if __name__ == "__main__":
