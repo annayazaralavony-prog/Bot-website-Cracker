@@ -4,6 +4,7 @@ import sqlite3
 import asyncio
 import traceback
 import aiohttp
+from datetime import datetime, timezone
 from threading import Thread
 from flask import Flask
 from bs4 import BeautifulSoup
@@ -14,7 +15,7 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -46,6 +47,10 @@ STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", "-100123456789"))
 TELETHON_SESSION_STRING = os.environ.get("TELETHON_SESSION_STRING", "").strip()
 
 MAX_SITES = 5  # মেনুতে সর্বোচ্চ কয়টি ওয়েবসাইট বাটন থাকবে
+DB_PATH = "scraped_data.db"
+# ডাটাবেস ব্যাকআপ যেখানে জমা থাকবে (না দিলে STORAGE_CHANNEL_ID তেই থাকবে)
+BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID") or STORAGE_CHANNEL_ID)
+BACKUP_TAG = "#DB_BACKUP"
 SITE_PREFIX = "🌐 "
 
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -55,25 +60,175 @@ if TELETHON_AVAILABLE and TELETHON_SESSION_STRING:
     telethon_client = TelegramClient(StringSession(TELETHON_SESSION_STRING), API_ID, API_HASH)
 
 # ================= ডাটাবেস =================
-conn = sqlite3.connect("scraped_data.db", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS uploaded_media (
-        media_url TEXT PRIMARY KEY,
-        hashtag TEXT
-    )
-""")
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS sites (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        name TEXT,
-        hashtag TEXT,
-        html TEXT,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-""")
-conn.commit()
+conn = None
+cursor = None
+
+def init_db():
+    """ডাটাবেস খোলে (আগে খোলা থাকলে বন্ধ করে আবার খোলে) এবং টেবিল তৈরি করে"""
+    global conn, cursor
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uploaded_media (
+            media_url TEXT PRIMARY KEY,
+            hashtag TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            name TEXT,
+            hashtag TEXT,
+            html TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+
+def db_is_empty():
+    cursor.execute("SELECT (SELECT COUNT(*) FROM sites), (SELECT COUNT(*) FROM uploaded_media)")
+    sites_n, media_n = cursor.fetchone()
+    return sites_n == 0 and media_n == 0
+
+init_db()
+
+# ================= টেলিগ্রাম ব্যাকআপ সিস্টেম =================
+backup_event = None        # main() এ তৈরি হয়
+backup_dirty = False       # ব্যাকআপ হয়নি এমন পরিবর্তন আছে কিনা
+last_backup_msg_id = None  # সর্বশেষ ব্যাকআপ মেসেজের আইডি
+
+def schedule_backup():
+    """ডাটাবেসে কিছু বদলালে এটা কল হয়; কয়েক সেকেন্ড পর অটো ব্যাকআপ হবে"""
+    global backup_dirty
+    backup_dirty = True
+    if backup_event is not None:
+        backup_event.set()
+
+def _make_snapshot():
+    snap = "scraped_data_snapshot.db"
+    if os.path.exists(snap):
+        os.remove(snap)
+    dst = sqlite3.connect(snap)
+    conn.backup(dst)
+    dst.close()
+    return snap
+
+async def do_backup():
+    """ডাটাবেসের কপি টেলিগ্রাম চ্যানেলে আপলোড করে পিন করে। (ok, info) রিটার্ন করে"""
+    global backup_dirty, last_backup_msg_id
+    snap = None
+    backup_dirty = False
+    try:
+        snap = _make_snapshot()
+        size_mb = os.path.getsize(snap) / (1024 * 1024)
+        if size_mb > 45:
+            backup_dirty = True
+            return False, f"Database too large for bot upload ({size_mb:.1f} MB)"
+
+        cursor.execute("SELECT (SELECT COUNT(*) FROM sites), (SELECT COUNT(*) FROM uploaded_media)")
+        sites_n, media_n = cursor.fetchone()
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        msg = await bot.send_document(
+            BACKUP_CHANNEL_ID,
+            snap,
+            file_name="scraped_data_backup.db",
+            caption=f"{BACKUP_TAG}\n🕒 {stamp}\n🌐 Sites: {sites_n}\n🎬 Media records: {media_n}"
+        )
+        try:
+            await bot.pin_chat_message(BACKUP_CHANNEL_ID, msg.id, disable_notification=True)
+        except Exception as pin_err:
+            print(f"⚠️ Backup pin failed (give bot 'Pin Messages' admin right): {pin_err}")
+
+        old_id = last_backup_msg_id
+        last_backup_msg_id = msg.id
+        if old_id and old_id != msg.id:
+            try:
+                await bot.delete_messages(BACKUP_CHANNEL_ID, old_id)
+            except Exception:
+                pass
+        return True, stamp
+    except Exception as e:
+        backup_dirty = True
+        return False, f"{type(e).__name__}: {str(e)}"
+    finally:
+        if snap and os.path.exists(snap):
+            os.remove(snap)
+
+async def backup_worker():
+    """পরিবর্তন হলে ১০ সেকেন্ড অপেক্ষা করে একবারে ব্যাকআপ নেয় (বারবার আপলোড এড়াতে)"""
+    while True:
+        await backup_event.wait()
+        await asyncio.sleep(10)
+        backup_event.clear()
+        if backup_dirty:
+            ok, info = await do_backup()
+            if not ok:
+                print(f"⚠️ Auto backup failed: {info}")
+                await asyncio.sleep(60)
+                backup_event.set()
+        await asyncio.sleep(20)
+
+def _valid_backup_file(path):
+    try:
+        c = sqlite3.connect(path)
+        names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        c.close()
+        return "sites" in names and "uploaded_media" in names
+    except Exception:
+        return False
+
+async def restore_db_from_telegram():
+    """ডিপ্লয়ের পর ডাটাবেস খালি থাকলে টেলিগ্রামের সর্বশেষ ব্যাকআপ থেকে ফিরিয়ে আনে"""
+    global last_backup_msg_id
+    if not db_is_empty():
+        return "Local database already has data - restore skipped."
+
+    path = None
+    msg_id = None
+
+    # ১. পিন করা ব্যাকআপ মেসেজ থেকে (বট দিয়ে)
+    try:
+        chat = await bot.get_chat(BACKUP_CHANNEL_ID)
+        pm = chat.pinned_message
+        if pm and pm.document and (pm.caption or "").startswith(BACKUP_TAG):
+            path = await bot.download_media(pm, file_name="./restore_tmp.db")
+            msg_id = pm.id
+    except Exception as e:
+        print(f"⚠️ Pinned backup lookup failed: {type(e).__name__}: {e}")
+
+    # ২. না পেলে Telethon দিয়ে চ্যানেলে #DB_BACKUP সার্চ
+    if not path:
+        t_ok, _ = await ensure_telethon_connected()
+        if t_ok:
+            try:
+                async for m in telethon_client.iter_messages(BACKUP_CHANNEL_ID, search=BACKUP_TAG, limit=20):
+                    if m.document:
+                        path = await telethon_client.download_media(m, "restore_tmp.db")
+                        msg_id = m.id
+                        break
+            except Exception as e:
+                print(f"⚠️ Telethon backup search failed: {type(e).__name__}: {e}")
+
+    if not path or not os.path.exists(path):
+        return "No backup found in Telegram (fresh start)."
+    if not _valid_backup_file(path):
+        os.remove(path)
+        return "Backup file found but invalid - ignored."
+
+    conn.close()
+    os.replace(path, DB_PATH)
+    init_db()
+    last_backup_msg_id = msg_id
+    cursor.execute("SELECT (SELECT COUNT(*) FROM sites), (SELECT COUNT(*) FROM uploaded_media)")
+    sites_n, media_n = cursor.fetchone()
+    return f"Restored from Telegram backup: {sites_n} sites, {media_n} media records."
 
 def is_duplicate(url):
     cursor.execute("SELECT 1 FROM uploaded_media WHERE media_url = ?", (url,))
@@ -82,6 +237,7 @@ def is_duplicate(url):
 def mark_as_uploaded(url, hashtag):
     cursor.execute("INSERT OR IGNORE INTO uploaded_media (media_url, hashtag) VALUES (?, ?)", (url, hashtag))
     conn.commit()
+    schedule_backup()
 
 def save_site(user_id, name, hashtag, html):
     """একই নামের সাইট থাকলে আপডেট করবে, নাহলে নতুন সেভ করবে। শুধু শেষ ৫টা রাখবে।"""
@@ -106,6 +262,7 @@ def save_site(user_id, name, hashtag, html):
         (user_id, user_id, MAX_SITES)
     )
     conn.commit()
+    schedule_backup()
     return site_id
 
 def get_sites(user_id):
@@ -127,6 +284,7 @@ def find_site_by_label(user_id, label):
 def delete_site(user_id, site_id):
     cursor.execute("DELETE FROM sites WHERE user_id = ? AND id = ?", (user_id, site_id))
     conn.commit()
+    schedule_backup()
 
 # ================= ইউজার সেশন মেমোরি =================
 user_sessions = {}
@@ -213,6 +371,17 @@ async def update_panel(client, user_id, text, reply_markup=None):
             )
             user_sessions.setdefault(user_id, {})["panel_msg_id"] = msg.id
 
+async def reset_panel(client, user_id):
+    """পুরনো প্যানেল মেসেজ মুছে দেয়, যাতে পরের update_panel নতুন মেসেজ হিসেবে চ্যাটের একদম নিচে আসে"""
+    session = user_sessions.setdefault(user_id, {})
+    old_id = session.get("panel_msg_id")
+    if old_id:
+        try:
+            await client.delete_messages(user_id, old_id)
+        except Exception:
+            pass
+    session["panel_msg_id"] = None
+
 # ================= Telethon কানেকশন চেক =================
 async def ensure_telethon_connected():
     if not TELETHON_AVAILABLE:
@@ -244,6 +413,8 @@ async def register_site(client, user_id, html_content, hashtag):
     user_sessions.setdefault(user_id, {})["state"] = "IDLE"
     user_sessions[user_id]["buffer"] = []
 
+    await reset_panel(client, user_id)
+    await refresh_menu(client, user_id)
     await update_panel(
         client, user_id,
         f"✅ **Website Saved**\n\n"
@@ -254,12 +425,12 @@ async def register_site(client, user_id, html_content, hashtag):
         f"মেসেজ বক্সের পাশের মেনু বাটনে সাইটের নাম যোগ হয়েছে। এখনই স্ক্যান করতে নিচের বাটনে ক্লিক করুন:",
         get_site_keyboard(site_id)
     )
-    await refresh_menu(client, user_id)
 
 async def show_site_panel(client, user_id, site):
     site_id, name, hashtag, html = site
     _t, videos, images = extract_media_from_html(html)
     user_sessions.setdefault(user_id, {})["state"] = "IDLE"
+    await reset_panel(client, user_id)
     await update_panel(
         client, user_id,
         f"🌐 **{name}**\n\n"
@@ -297,9 +468,31 @@ async def start_cmd(client, message):
         f"📦 **Storage Channel:** `{STORAGE_CHANNEL_ID}`\n\n"
         "ওয়েবসাইটের HTML কোড বা ফাইল থেকে ভিডিও ও ছবি স্বয়ংক্রিয়ভাবে স্টোরেজ চ্যানেলে আপলোড করতে নিচের বাটনে ক্লিক করুন:"
     )
-    await update_panel(client, user_id, welcome_text, get_home_keyboard())
+    await reset_panel(client, user_id)
     if get_sites(user_id):
         await refresh_menu(client, user_id)
+    await update_panel(client, user_id, welcome_text, get_home_keyboard())
+
+@bot.on_message(filters.command("backup") & filters.private)
+async def backup_cmd(client, message):
+    user_id = message.from_user.id
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await reset_panel(client, user_id)
+    await update_panel(client, user_id, "💾 **Creating database backup in Telegram...**")
+    ok, info = await do_backup()
+    if ok:
+        text = (
+            "✅ **BACKUP COMPLETED**\n\n"
+            f"• **Time:** `{info}`\n"
+            f"• **Saved In:** `{BACKUP_CHANNEL_ID}` (pinned message)\n"
+            "• **Auto Restore:** `Enabled on every deploy/restart`"
+        )
+    else:
+        text = f"❌ **BACKUP FAILED**\n\n**Reason:** `{info}`\n\nCheck that the bot is admin in the channel with Post/Pin/Delete rights."
+    await update_panel(client, user_id, text, get_home_keyboard())
 
 @bot.on_callback_query()
 async def handle_callbacks(client, cq):
@@ -779,7 +972,28 @@ def run_flask():
     port = int(os.environ.get("PORT", 8080))
     web_app.run(host="0.0.0.0", port=port)
 
+async def main():
+    global backup_event
+    await bot.start()
+    try:
+        status = await restore_db_from_telegram()
+    except Exception as e:
+        status = f"Restore error: {type(e).__name__}: {e}"
+    print(f"💾 {status}")
+
+    backup_event = asyncio.Event()
+    worker = asyncio.create_task(backup_worker())
+    print("🤖 Bot is running with Telegram DB backup enabled.")
+
+    await idle()  # SIGTERM (Render deploy/restart) এলে এখান থেকে বের হবে
+
+    worker.cancel()
+    if backup_dirty:
+        print("💾 Final backup before shutdown...")
+        await do_backup()
+    await bot.stop()
+
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
     print(f"🤖 Starting Hybrid Scraper Bot... (Telethon available: {TELETHON_AVAILABLE})")
-    bot.run()
+    asyncio.get_event_loop().run_until_complete(main())
