@@ -2,10 +2,9 @@ import os
 import re
 import time
 import asyncio
-import aiohttp
-import html as htmllib
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup, Tag, NavigableString
+from curl_cffi.requests import AsyncSession
 
 # ================= ওয়েবসাইট কনফিগারেশন =================
 SITE_NAME = "MMSDesi"
@@ -35,7 +34,7 @@ HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "summary"]
 def _normalize_url(url):
     if not url or not isinstance(url, str):
         return None
-    u = htmllib.unescape(url.strip().strip("\"'"))
+    u = htmllib.unescape(url.strip().strip("\"'")) if 'htmllib' in globals() else url.strip().strip("\"'")
     if u.startswith("//"):
         u = "https:" + u
     elif u.startswith("/"):
@@ -245,11 +244,8 @@ def extract_albums(html_content):
     return page_title, _finalize_albums([{"title": page_title, "items": all_items}])
 
 
-# ================= কুকি ও 403 বাইপাস ডাউনলোডার =================
+# ================= curl_cffi দিয়ে Cloudflare ও 403 বাইপাস ডাউনলোডার =================
 async def custom_download(url, dest_path, state=None, progress_cb=None, max_bytes=None):
-    parsed = urlparse(url)
-    origin_host = f"{parsed.scheme}://{parsed.netloc}"
-
     user_cookie = (
         "_ga=GA1.1.2033937358.1793779443; "
         "dom3ic8zudi28v8lr6fgphwffqoz0j6c=01a1a596-297f-73bb-aeee-f1c73ed0e533; "
@@ -267,82 +263,55 @@ async def custom_download(url, dest_path, state=None, progress_cb=None, max_byte
         "sb_count_91b7e623af01664a963f1516a146e8b0=1"
     )
 
-    referer_profiles = [
-        {"Referer": "https://mmsdesi.me/", "Origin": "https://mmsdesi.me"},
-        {"Referer": "https://www.mmsdesi.me/", "Origin": "https://www.mmsdesi.me"},
-        {"Referer": f"{origin_host}/"},
-        {}
-    ]
-
-    base_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
+    headers = {
+        "Referer": "https://mmsdesi.me/",
+        "Origin": "https://mmsdesi.me",
+        "Cookie": user_cookie,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-        "Cookie": user_cookie,
-        "Sec-Fetch-Dest": "video",
-        "Sec-Fetch-Mode": "no-cors",
-        "Sec-Fetch-Site": "cross-site",
     }
 
     last_err = "Unknown error"
 
-    for attempt, extra_hdr in enumerate(referer_profiles, start=1):
+    try:
         if state and state.get("cancel"):
             raise asyncio.CancelledError("Scan cancelled by user")
 
-        headers = dict(base_headers)
-        headers.update(extra_hdr)
+        # impersonate="chrome" আসল ব্রাউজারের মতো TLS হ্যান্ডশেক করবে ফলে 403 ব্লক করবে না
+        async with AsyncSession(impersonate="chrome") as session:
+            response = await session.get(url, headers=headers, allow_redirects=True, timeout=300)
+            
+            if response.status_code != 200:
+                return False, f"HTTP Error {response.status_code} - Server blocked."
 
-        try:
-            timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
-            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-                async with session.get(url, allow_redirects=True) as resp:
-                    if resp.status in (403, 401) and attempt < len(referer_profiles):
-                        last_err = f"HTTP Error {resp.status} ({resp.reason}) - Server blocked or file removed."
-                        continue
+            content = response.content
+            if not content:
+                return False, "Downloaded file is 0 bytes."
 
-                    if resp.status != 200:
-                        return False, f"HTTP Error {resp.status} ({resp.reason}) - Server blocked or file removed."
+            total = len(content)
+            if max_bytes and total > max_bytes:
+                return False, "File exceeds size limit."
 
-                    total = resp.content_length or 0
-                    if max_bytes and total and total > max_bytes:
-                        return False, f"File too large ({total // (1024 * 1024)} MB)."
-
-                    downloaded = 0
-                    last_cb = time.monotonic()
-                    with open(dest_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(1024 * 1024):
-                            if state and state.get("cancel"):
-                                raise asyncio.CancelledError("Scan cancelled by user")
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if max_bytes and downloaded > max_bytes:
-                                return False, "File exceeds size limit."
-                            if progress_cb and time.monotonic() - last_cb >= 4:
-                                last_cb = time.monotonic()
-                                try:
-                                    await progress_cb(downloaded, total)
-                                except Exception:
-                                    pass
+            with open(dest_path, "wb") as f:
+                f.write(content)
 
             if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                if progress_cb:
+                    try:
+                        await progress_cb(total, total)
+                    except Exception:
+                        pass
                 return True, "OK"
-            last_err = "Downloaded file is 0 bytes."
 
-        except asyncio.CancelledError:
-            if os.path.exists(dest_path):
-                os.remove(dest_path)
-            raise
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {str(e)}"
+            last_err = "Failed to save file."
 
+    except asyncio.CancelledError:
         if os.path.exists(dest_path):
             os.remove(dest_path)
-        await asyncio.sleep(2)
+        raise
+    except Exception as e:
+        last_err = f"{type(e).__name__}: {str(e)}"
 
+    if os.path.exists(dest_path):
+        os.remove(dest_path)
     return False, last_err
