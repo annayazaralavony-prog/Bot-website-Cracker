@@ -100,7 +100,7 @@ DOWNLOAD_PARALLEL = max(1, int(os.environ.get("DOWNLOAD_PARALLEL", "5")))
 
 SITES_DIR = "sites"  # গিটহাবে এই ফোল্ডারে সাইটের ফাইলগুলো রাখবেন (অথবা রুট ফোল্ডারে)
 DB_PATH = "scraped_data.db"
-BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID") or STORAGE_CHANNEL_ID)
+BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID") or -1004448646419)
 BACKUP_TAG = "#DB_BACKUP"
 SITE_PREFIX = "🌐 "
 
@@ -145,12 +145,36 @@ def init_db():
             hashtag TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS site_html (
+            site_key TEXT PRIMARY KEY,
+            html TEXT
+        )
+    """)
     conn.commit()
 
 def db_is_empty():
     cursor.execute("SELECT COUNT(*) FROM uploaded_media")
     (media_n,) = cursor.fetchone()
-    return media_n == 0
+    cursor.execute("SELECT COUNT(*) FROM site_html")
+    (html_n,) = cursor.fetchone()
+    return media_n == 0 and html_n == 0
+
+# ---- [NEW] "Send New HTML" দিয়ে পাঠানো HTML স্থায়ীভাবে ডাটাবেসে সেভ (ডিপ্লয়ের পরও থাকবে) ----
+def save_site_html(site_key, html_content):
+    if not html_content or not html_content.strip():
+        return
+    cursor.execute("INSERT OR REPLACE INTO site_html (site_key, html) VALUES (?, ?)", (site_key, html_content))
+    conn.commit()
+    schedule_backup()
+
+def db_get_site_html(site_key):
+    try:
+        cursor.execute("SELECT html FROM site_html WHERE site_key = ?", (site_key,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
 
 init_db()
 
@@ -187,13 +211,15 @@ async def do_backup():
 
         cursor.execute("SELECT COUNT(*) FROM uploaded_media")
         (media_n,) = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*) FROM site_html")
+        (html_n,) = cursor.fetchone()
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
         msg = await bot.send_document(
             BACKUP_CHANNEL_ID,
             snap,
             file_name="scraped_data_backup.db",
-            caption=f"{BACKUP_TAG}\n🕒 {stamp}\n🎬 Media records: {media_n}"
+            caption=f"{BACKUP_TAG}\n🕒 {stamp}\n🎬 Media records: {media_n}\n📄 Saved HTML: {html_n}"
         )
         try:
             await bot.pin_chat_message(BACKUP_CHANNEL_ID, msg.id, disable_notification=True)
@@ -499,6 +525,8 @@ def albums_panel_text(albums):
 async def show_site_panel(client, user_id, site, override_html=None):
     discover_sites()
     site = loaded_sites.get(site["key"], site)
+    if override_html is None:
+        override_html = db_get_site_html(site["key"])
     try:
         _title, albums = get_site_albums(site, override_html)
         err_txt = ""
@@ -705,6 +733,7 @@ async def handle_text_input(client, message):
         site_key = sess.get("active_site_key")
         site = loaded_sites.get(site_key)
         if site:
+            save_site_html(site["key"], message.text)
             await show_site_panel(client, user_id, site, override_html=message.text)
 
 @bot.on_message(filters.document & filters.private)
@@ -736,6 +765,7 @@ async def handle_document_input(client, message):
             html_content = f.read()
         if os.path.exists(file_path):
             os.remove(file_path)
+        save_site_html(site["key"], html_content)
         await show_site_panel(client, user_id, site, override_html=html_content)
     except Exception as e:
         if file_path and os.path.exists(file_path):
@@ -852,11 +882,18 @@ async def download_file_with_details(url, dest_path, site_mod, state=None, progr
     return False, f"{last_err} (failed after 3 attempts)"
 
 def build_caption(title, a_idx, total_albums, part, multi_part, hashtag):
-    cap = f"<b>{htmllib.escape(title[:200])}</b>\n📁 Album {a_idx}/{total_albums}"
-    if multi_part:
-        cap += f" • Part {part}"
-    cap += f"\n{htmllib.escape(hashtag)}"
-    return cap
+    single_tag = "#" + hashtag.lstrip("#").split()[0] if hashtag else "#mmsdesi"
+
+    # প্রথম পার্টের (প্রথম ১০টি ভিডিও) জন্য মূল ক্যাপশন এবং হ্যাশট্যাগ থাকবে
+    if part == 1:
+        clean_title = re.sub(r"#\S+", "", title or "").strip()
+        if clean_title:
+            return f"<b>{htmllib.escape(clean_title[:200])}</b>\n{htmllib.escape(single_tag)}"
+        return htmllib.escape(single_tag)
+
+    # পরবর্তী পার্টগুলোর জন্য শুধু হ্যাশট্যাগ থাকবে
+    else:
+        return htmllib.escape(single_tag)
 
 # ---- [CHANGED] uploader = {"type": "telethon"/"pyrogram", "client": ..., "name": ...}
 # প্রতিটি অ্যালবাম একটিমাত্র uploader (অ্যাকাউন্ট) দিয়েই সম্পূর্ণ আপলোড হবে ----
@@ -975,6 +1012,8 @@ async def start_scan(client, user_id, site, override_html=None):
     old = active_scans.get(user_id)
     if old and not old["task"].done():
         return False
+    if override_html is None:
+        override_html = db_get_site_html(site["key"])
     state = {"cancel": False}
     task = asyncio.create_task(process_and_upload(client, user_id, site, override_html, state))
     state["task"] = task
