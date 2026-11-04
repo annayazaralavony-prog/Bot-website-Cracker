@@ -1,6 +1,7 @@
 pyrogram
 tgcrypto
 telethon
+hachoir
 aiohttp
 beautifulsoup4
 flask
