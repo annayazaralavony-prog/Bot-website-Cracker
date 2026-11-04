@@ -9,19 +9,19 @@ from flask import Flask
 from bs4 import BeautifulSoup
 
 # ================= Python 3.14 Event Loop Fix =================
-# Pyrogram ইমপোর্ট করার আগেই মেইন থ্রেডে ইভেন্ট লুপ সেট করা হচ্ছে
 try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-# Pyrogram (বট বাটন ও সিঙ্গেল মেসেজ প্যানেলের জন্য)
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+)
 from pyrogram.errors import FloodWait, RPCError
 
-# Telethon (ইউজার সেশন স্ট্রিং দিয়ে চ্যানেল স্ক্যান ও বড় ফাইল আপলোডের জন্য)
-# FIX: telethon ইনস্টল না থাকলেও বট ক্র্যাশ করবে না
+# Telethon (optional - ইনস্টল না থাকলেও বট ক্র্যাশ করবে না)
 try:
     from telethon import TelegramClient
     from telethon.sessions import StringSession
@@ -38,28 +38,39 @@ except ImportError:
     class TelethonRPCError(Exception):
         pass
 
-# ================= কনফিগারেশন (Environment Variables) =================
+# ================= কনফিগারেশন =================
 API_ID = int(os.environ.get("API_ID", "123456"))
 API_HASH = os.environ.get("API_HASH", "your_api_hash")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
 STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", "-100123456789"))
 TELETHON_SESSION_STRING = os.environ.get("TELETHON_SESSION_STRING", "").strip()
 
-# Pyrogram Bot Client
+MAX_SITES = 5  # মেনুতে সর্বোচ্চ কয়টি ওয়েবসাইট বাটন থাকবে
+SITE_PREFIX = "🌐 "
+
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Telethon User Client (StringSession)
 telethon_client = None
 if TELETHON_AVAILABLE and TELETHON_SESSION_STRING:
     telethon_client = TelegramClient(StringSession(TELETHON_SESSION_STRING), API_ID, API_HASH)
 
-# ================= ডাটাবেস সেটআপ (ডুপ্লিকেট রোধ করার জন্য) =================
+# ================= ডাটাবেস =================
 conn = sqlite3.connect("scraped_data.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS uploaded_media (
         media_url TEXT PRIMARY KEY,
         hashtag TEXT
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS sites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        name TEXT,
+        hashtag TEXT,
+        html TEXT,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
 """)
 conn.commit()
@@ -72,10 +83,55 @@ def mark_as_uploaded(url, hashtag):
     cursor.execute("INSERT OR IGNORE INTO uploaded_media (media_url, hashtag) VALUES (?, ?)", (url, hashtag))
     conn.commit()
 
-# ================= ইউজার সেশন মেমোরি (Single Message Tracker) =================
+def save_site(user_id, name, hashtag, html):
+    """একই নামের সাইট থাকলে আপডেট করবে, নাহলে নতুন সেভ করবে। শুধু শেষ ৫টা রাখবে।"""
+    cursor.execute("SELECT id FROM sites WHERE user_id = ? AND name = ?", (user_id, name))
+    row = cursor.fetchone()
+    if row:
+        site_id = row[0]
+        cursor.execute(
+            "UPDATE sites SET html = ?, hashtag = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (html, hashtag, site_id)
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO sites (user_id, name, hashtag, html) VALUES (?, ?, ?, ?)",
+            (user_id, name, hashtag, html)
+        )
+        site_id = cursor.lastrowid
+    # পুরনো সাইট মুছে শুধু সর্বশেষ MAX_SITES রাখা
+    cursor.execute(
+        "DELETE FROM sites WHERE user_id = ? AND id NOT IN "
+        "(SELECT id FROM sites WHERE user_id = ? ORDER BY updated_at DESC, id DESC LIMIT ?)",
+        (user_id, user_id, MAX_SITES)
+    )
+    conn.commit()
+    return site_id
+
+def get_sites(user_id):
+    cursor.execute(
+        "SELECT id, name, hashtag FROM sites WHERE user_id = ? ORDER BY updated_at DESC, id DESC LIMIT ?",
+        (user_id, MAX_SITES)
+    )
+    return cursor.fetchall()
+
+def get_site(user_id, site_id):
+    cursor.execute("SELECT id, name, hashtag, html FROM sites WHERE user_id = ? AND id = ?", (user_id, site_id))
+    return cursor.fetchone()
+
+def find_site_by_label(user_id, label):
+    name = label[len(SITE_PREFIX):] if label.startswith(SITE_PREFIX) else label
+    cursor.execute("SELECT id, name, hashtag, html FROM sites WHERE user_id = ? AND name = ?", (user_id, name))
+    return cursor.fetchone()
+
+def delete_site(user_id, site_id):
+    cursor.execute("DELETE FROM sites WHERE user_id = ? AND id = ?", (user_id, site_id))
+    conn.commit()
+
+# ================= ইউজার সেশন মেমোরি =================
 user_sessions = {}
 
-# ================= কিবোর্ড বাটনসমূহ (Inline Buttons) =================
+# ================= Inline বাটন =================
 def get_home_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("add HTML FILE 🗄️", callback_data="menu_add_html")],
@@ -95,42 +151,69 @@ def get_tags_keyboard():
 def get_waiting_html_keyboard(parts_count=0):
     buttons = []
     if parts_count > 0:
-        buttons.append([InlineKeyboardButton(f"✅ Process Now ({parts_count} Parts Collected)", callback_data="action_process")])
+        buttons.append([InlineKeyboardButton(f"✅ Save Website ({parts_count} Parts Collected)", callback_data="action_process")])
     buttons.append([InlineKeyboardButton("❌ Cancel / Home", callback_data="menu_home")])
     return InlineKeyboardMarkup(buttons)
 
-# ================= মেসেজ আপডেট হেল্পার (একই মেসেজে এডিট করার ফাংশন) =================
+def get_site_keyboard(site_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 Scan Website", callback_data=f"site_scan_{site_id}")],
+        [InlineKeyboardButton("🗑️ Delete", callback_data=f"site_del_{site_id}"),
+         InlineKeyboardButton("🏠 Home", callback_data="menu_home")]
+    ])
+
+# ================= মেসেজ বক্সের পাশের মেনু (Reply Keyboard) =================
+def build_sites_reply_keyboard(user_id):
+    sites = get_sites(user_id)
+    if not sites:
+        return None
+    rows = [[KeyboardButton(f"{SITE_PREFIX}{name}")] for (_id, name, _tag) in sites]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, placeholder="Select a website...")
+
+async def refresh_menu(client, user_id):
+    """সাইট লিস্ট অনুযায়ী মেসেজ বক্সের মেনু আপডেট করে"""
+    session = user_sessions.setdefault(user_id, {})
+    kb = build_sites_reply_keyboard(user_id)
+    old_id = session.get("kb_msg_id")
+    try:
+        if kb:
+            msg = await client.send_message(user_id, "📚 Website menu updated", reply_markup=kb)
+        else:
+            msg = await client.send_message(user_id, "📚 Website menu cleared", reply_markup=ReplyKeyboardRemove())
+        session["kb_msg_id"] = msg.id
+        if old_id:
+            try:
+                await client.delete_messages(user_id, old_id)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# ================= প্যানেল আপডেট হেল্পার =================
 async def update_panel(client, user_id, text, reply_markup=None):
     session = user_sessions.get(user_id, {})
     msg_id = session.get("panel_msg_id")
     try:
         if msg_id:
             await client.edit_message_text(
-                chat_id=user_id,
-                message_id=msg_id,
-                text=text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True
+                chat_id=user_id, message_id=msg_id, text=text,
+                reply_markup=reply_markup, disable_web_page_preview=True
             )
         else:
             msg = await client.send_message(
-                chat_id=user_id,
-                text=text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True
+                chat_id=user_id, text=text,
+                reply_markup=reply_markup, disable_web_page_preview=True
             )
             user_sessions.setdefault(user_id, {})["panel_msg_id"] = msg.id
     except RPCError as e:
         if "MESSAGE_NOT_MODIFIED" not in str(e):
             msg = await client.send_message(
-                chat_id=user_id,
-                text=text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True
+                chat_id=user_id, text=text,
+                reply_markup=reply_markup, disable_web_page_preview=True
             )
             user_sessions.setdefault(user_id, {})["panel_msg_id"] = msg.id
 
-# ================= Telethon কানেকশন চেক করার ফাংশন =================
+# ================= Telethon কানেকশন চেক =================
 async def ensure_telethon_connected():
     if not TELETHON_AVAILABLE:
         return False, "Telethon library is not installed. Add 'telethon' to requirements.txt."
@@ -145,7 +228,49 @@ async def ensure_telethon_connected():
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)}"
 
-# ================= স্টার্ট কমান্ড ও বাটন কলব্যাক হ্যান্ডলার =================
+# ================= ওয়েবসাইট সেভ ও সাইট প্যানেল =================
+def make_site_name(title):
+    name = re.sub(r"\s+", " ", title or "").strip()
+    if not name:
+        name = "Website"
+    return name[:30]
+
+async def register_site(client, user_id, html_content, hashtag):
+    """HTML সেভ করে মেনু বাটনে সাইটের নাম যোগ করে (তখনই স্ক্যান করে না)"""
+    title, videos, images = extract_media_from_html(html_content)
+    name = make_site_name(title)
+    site_id = save_site(user_id, name, hashtag, html_content)
+
+    user_sessions.setdefault(user_id, {})["state"] = "IDLE"
+    user_sessions[user_id]["buffer"] = []
+
+    await update_panel(
+        client, user_id,
+        f"✅ **Website Saved**\n\n"
+        f"🌐 **Name:** `{name}`\n"
+        f"🏷️ **Hashtag:** `{hashtag}`\n"
+        f"🎬 **Videos Found:** `{len(videos)}`\n"
+        f"🖼️ **Images Found:** `{len(images)}`\n\n"
+        f"মেসেজ বক্সের পাশের মেনু বাটনে সাইটের নাম যোগ হয়েছে। এখনই স্ক্যান করতে নিচের বাটনে ক্লিক করুন:",
+        get_site_keyboard(site_id)
+    )
+    await refresh_menu(client, user_id)
+
+async def show_site_panel(client, user_id, site):
+    site_id, name, hashtag, html = site
+    _t, videos, images = extract_media_from_html(html)
+    user_sessions.setdefault(user_id, {})["state"] = "IDLE"
+    await update_panel(
+        client, user_id,
+        f"🌐 **{name}**\n\n"
+        f"🏷️ **Hashtag:** `{hashtag}`\n"
+        f"🎬 **Videos Found:** `{len(videos)}`\n"
+        f"🖼️ **Images Found:** `{len(images)}`\n\n"
+        f"ওয়েবসাইট থেকে ভিডিও ও ছবি স্ক্যান করে আপলোড করতে নিচের বাটনে ক্লিক করুন:",
+        get_site_keyboard(site_id)
+    )
+
+# ================= স্টার্ট কমান্ড ও কলব্যাক =================
 @bot.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
     user_id = message.from_user.id
@@ -154,11 +279,13 @@ async def start_cmd(client, message):
     except Exception:
         pass
 
+    old = user_sessions.get(user_id, {})
     user_sessions[user_id] = {
         "state": "IDLE",
         "buffer": [],
         "hashtag": "#rells",
-        "panel_msg_id": user_sessions.get(user_id, {}).get("panel_msg_id")
+        "panel_msg_id": old.get("panel_msg_id"),
+        "kb_msg_id": old.get("kb_msg_id")
     }
 
     t_ok, t_status = await ensure_telethon_connected()
@@ -171,6 +298,8 @@ async def start_cmd(client, message):
         "ওয়েবসাইটের HTML কোড বা ফাইল থেকে ভিডিও ও ছবি স্বয়ংক্রিয়ভাবে স্টোরেজ চ্যানেলে আপলোড করতে নিচের বাটনে ক্লিক করুন:"
     )
     await update_panel(client, user_id, welcome_text, get_home_keyboard())
+    if get_sites(user_id):
+        await refresh_menu(client, user_id)
 
 @bot.on_callback_query()
 async def handle_callbacks(client, cq):
@@ -192,7 +321,7 @@ async def handle_callbacks(client, cq):
                 client, user_id,
                 f"🤖 **HTML Media Scraper Dashboard**\n\n"
                 f"⚡ **Telethon Engine:** `{engine_status}`\n"
-                f"নতুন ফাইল বা কোড স্ক্যান করতে নিচের বাটনে ক্লিক করুন:",
+                f"নতুন ফাইল বা কোড যোগ করতে নিচের বাটনে ক্লিক করুন:",
                 get_home_keyboard()
             )
 
@@ -262,9 +391,29 @@ async def handle_callbacks(client, cq):
                 return
             full_html = "".join(buffer_list)
             hashtag = user_sessions[user_id].get("hashtag", "#rells")
-            user_sessions[user_id]["buffer"] = []
+            await register_site(client, user_id, full_html, hashtag)
+
+        elif data.startswith("site_scan_"):
+            site_id = int(data.split("_")[2])
+            site = get_site(user_id, site_id)
+            if not site:
+                await cq.answer("⚠️ Website not found. Please add it again.", show_alert=True)
+                return
+            _id, name, hashtag, html = site
             user_sessions[user_id]["state"] = "PROCESSING"
-            await process_and_upload(client, user_id, full_html, hashtag)
+            await cq.answer("Scanning website...")
+            await process_and_upload(client, user_id, html, hashtag)
+            return
+
+        elif data.startswith("site_del_"):
+            site_id = int(data.split("_")[2])
+            delete_site(user_id, site_id)
+            await update_panel(
+                client, user_id,
+                "🗑️ **Website deleted from menu.**",
+                get_home_keyboard()
+            )
+            await refresh_menu(client, user_id)
 
         await cq.answer()
 
@@ -278,7 +427,7 @@ async def handle_callbacks(client, cq):
             get_home_keyboard()
         )
 
-# ================= টেক্সট ও ডকুমেন্ট ইনপুট হ্যান্ডলার =================
+# ================= টেক্সট ও ডকুমেন্ট ইনপুট =================
 @bot.on_message(filters.text & filters.private)
 async def handle_text_input(client, message):
     user_id = message.from_user.id
@@ -291,6 +440,13 @@ async def handle_text_input(client, message):
 
     if user_id not in user_sessions:
         user_sessions[user_id] = {"state": "IDLE", "buffer": [], "hashtag": "#rells"}
+
+    # মেনু বাটনে সাইটের নামে ক্লিক করলে
+    if text.startswith(SITE_PREFIX):
+        site = find_site_by_label(user_id, text)
+        if site:
+            await show_site_panel(client, user_id, site)
+            return
 
     state = user_sessions[user_id].get("state")
 
@@ -319,7 +475,7 @@ async def handle_text_input(client, message):
             f"🏷️ **Hashtag:** `{hashtag}`\n"
             f"🧩 **Parts Collected:** `{parts} part(s)`\n"
             f"📊 **Total Size:** `{total_chars} characters`\n\n"
-            f"সবগুলো অংশ পেস্ট করা শেষ হলে নিচের **✅ Process Now** বাটনে ক্লিক করুন:",
+            f"সবগুলো অংশ পেস্ট করা শেষ হলে নিচের **✅ Save Website** বাটনে ক্লিক করুন:",
             get_waiting_html_keyboard(parts)
         )
 
@@ -362,7 +518,7 @@ async def handle_document_input(client, message):
         if os.path.exists(file_path):
             os.remove(file_path)
 
-        await process_and_upload(client, user_id, html_content, hashtag)
+        await register_site(client, user_id, html_content, hashtag)
 
     except Exception as e:
         if file_path and os.path.exists(file_path):
@@ -378,7 +534,7 @@ async def handle_document_input(client, message):
             get_home_keyboard()
         )
 
-# ================= স্ক্যান, ডাউনলোড ও Telethon আপলোড লজিক =================
+# ================= স্ক্যান, ডাউনলোড ও আপলোড লজিক =================
 def extract_media_from_html(html_content):
     soup = BeautifulSoup(html_content, "html.parser")
     page_title = soup.title.string.strip() if soup.title and soup.title.string else "Website Media"
@@ -408,7 +564,7 @@ async def download_file_with_details(url, dest_path):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     try:
-        timeout = aiohttp.ClientTimeout(total=1200)  # ২০ মিনিট টাইমআউট বড় ভিডিওর জন্য
+        timeout = aiohttp.ClientTimeout(total=1200)
         async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
@@ -457,7 +613,7 @@ async def upload_to_channel(file_path, caption, is_video=True):
 
 async def process_and_upload(client, user_id, html_content, hashtag):
     try:
-        await update_panel(client, user_id, "🔍 **Scanning HTML Code...**\nExtracting video and image links...")
+        await update_panel(client, user_id, "🔍 **Scanning Website...**\nExtracting video and image links...")
         title, videos, images = extract_media_from_html(html_content)
 
         if not videos and not images:
@@ -471,6 +627,7 @@ async def process_and_upload(client, user_id, html_content, hashtag):
                 "• **Possible Cause:** The website might be loading videos dynamically via encrypted JavaScript (m3u8/blob) or requires login cookies.",
                 get_home_keyboard()
             )
+            user_sessions.setdefault(user_id, {})["state"] = "IDLE"
             return
 
         new_videos = [v for v in videos if not is_duplicate(v)]
@@ -485,6 +642,7 @@ async def process_and_upload(client, user_id, html_content, hashtag):
                 f"• **Database Status:** Already exists in `uploaded_media` table.",
                 get_home_keyboard()
             )
+            user_sessions.setdefault(user_id, {})["state"] = "IDLE"
             return
 
         t_ok, _ = await ensure_telethon_connected()
@@ -532,7 +690,7 @@ async def process_and_upload(client, user_id, html_content, hashtag):
 
             except (FloodWait, FloodWaitError) as fw:
                 wait_sec = getattr(fw, "value", getattr(fw, "seconds", 10))
-                error_logs.append(f"• [Video #{idx} FloodWait]\n  Waited {wait_sec}s, file skipped (re-send HTML to retry).")
+                error_logs.append(f"• [Video #{idx} FloodWait]\n  Waited {wait_sec}s, file skipped (scan again to retry).")
                 await asyncio.sleep(wait_sec)
             except (RPCError, TelethonRPCError) as rpc_err:
                 error_logs.append(
@@ -576,7 +734,7 @@ async def process_and_upload(client, user_id, html_content, hashtag):
                 if os.path.exists(temp_img):
                     os.remove(temp_img)
 
-        # ৩. চূড়ান্ত রিপোর্ট ও ইংরেজি এরর সামারি একই মেসেজে দেখানো
+        # ৩. চূড়ান্ত রিপোর্ট
         summary_text = (
             f"🏁 **TASK COMPLETED REPORT**\n\n"
             f"⚡ **Engine Used:** `{uploader_mode}`\n"
@@ -595,7 +753,7 @@ async def process_and_upload(client, user_id, html_content, hashtag):
         else:
             summary_text += "\n✅ **Status:** `All media processed smoothly with 0 errors!`"
 
-        user_sessions[user_id]["state"] = "IDLE"
+        user_sessions.setdefault(user_id, {})["state"] = "IDLE"
         await update_panel(client, user_id, summary_text, get_home_keyboard())
 
     except Exception as fatal_e:
