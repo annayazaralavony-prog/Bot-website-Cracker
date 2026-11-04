@@ -12,12 +12,10 @@ SITE_NAME = "MMSDesi"
 HASHTAG = "#mms.desi"  # প্রতিটি অ্যালবামের ক্যাপশনের নিচে এই হ্যাশট্যাগ থাকবে
 BASE_URL = "https://mmsdesi.me/"
 
-# আপনি চাইলে সরাসরি নিচের তিন কোটেশনের ভেতর HTML পেস্ট করে রাখতে পারেন,
-# অথবা এটি খালি রেখে টেলিগ্রাম বটে সরাসরি .html ফাইল আপলোড করতে পারেন।
 HTML_CONTENT = """
 """
 
-# ================= মিডিয়া ও অ্যালবাম ডিটেকশন রেজেক্স =================
+# ================= রেজেক্স প্যাটার্ন =================
 VIDEO_EXT_RE = re.compile(
     r'https?://[^\s"\'<>\\]+?\.(?:mp4|m4v|webm|mov)(?:\?[^\s"\'<>\\]*)?',
     re.IGNORECASE
@@ -34,7 +32,6 @@ ALBUM_CONTAINER_RE = re.compile(
 HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "summary"]
 
 
-# ================= HTML থেকে অ্যালবাম স্ক্যান করার লজিক =================
 def _normalize_url(url):
     if not url or not isinstance(url, str):
         return None
@@ -56,19 +53,15 @@ def _extract_from_srcset(srcset_val):
 
 
 def classify_node(tag):
-    """একটি HTML ট্যাগ থেকে ভিডিও অথবা ছবি শনাক্ত করে"""
-    # ১. ভিডিও চেক (video, source, a, বা যেকোনো data-* অ্যাট্রিবিউটে .mp4 লিংক)
     for attr, val in tag.attrs.items():
         if isinstance(val, str):
             m = VIDEO_EXT_RE.search(val)
             if m:
                 return ("video", _normalize_url(m.group(0)))
 
-    # ২. ছবি চেক (img অথবা ছবির ডিরেক্ট লিংক থাকা a ট্যাগ)
     url = None
     if tag.name == "img":
         parent = tag.parent
-        # যদি ছবিটি কোনো ভিডিও লিংকের থাম্বনেইল হয়, তবে সেটি ছবি হিসেবে না নিয়ে বাদ দেবে
         if parent and parent.name == "a":
             href = parent.get("href") or ""
             if VIDEO_EXT_RE.search(href):
@@ -100,7 +93,6 @@ def classify_node(tag):
 
 
 def iter_scope_media(scope):
-    """নির্দিষ্ট ব্লকের ভেতর থেকে সব ছবি ও ভিডিও সিরিয়াল অনুযায়ী বের করে"""
     for node in scope.descendants:
         if isinstance(node, Tag):
             res = classify_node(node)
@@ -120,7 +112,6 @@ def _clean_title(text):
 
 
 def find_album_title(container):
-    """অ্যালবামের ক্যাপশন বা টাইটেল খুঁজে বের করে"""
     for sel in HEADING_TAGS:
         h = container.find(sel)
         if h:
@@ -153,7 +144,6 @@ def find_album_title(container):
 
 
 def _strategy_containers(soup):
-    """পদ্ধতি ১: প্রতিটি অ্যালবাম কার্ড/ব্লক আলাদা করে স্ক্যান করা"""
     candidates = []
     for t in soup.find_all(["article", "section", "div", "li", "details", "figure"]):
         cid = " ".join(t.get("class") or []) + " " + (t.get("id") or "")
@@ -166,7 +156,6 @@ def _strategy_containers(soup):
         if items:
             with_media.append((t, items))
 
-    # ভেতরে ছোট অ্যালবাম থাকলে উপরের বড় র‍্যাপার বাদ দেওয়া (যাতে ৩০-৪০টি অ্যালবাম আলাদা থাকে)
     all_ids = {id(t) for t, _ in with_media}
     albums = []
     for t, items in with_media:
@@ -180,7 +169,6 @@ def _strategy_containers(soup):
 
 
 def _strategy_headings(soup):
-    """পদ্ধতি ২: প্রতিটি হেডিং (h1-h6) থেকে পরের হেডিং পর্যন্ত থাকা মিডিয়া নিয়ে অ্যালবাম তৈরি করা"""
     albums = []
     current_album = None
     root = soup.body or soup
@@ -234,7 +222,6 @@ def _finalize_albums(raw_albums):
 
 
 def extract_albums(html_content):
-    """bot.py এই ফাংশনটি কল করে সব অ্যালবাম ও সেগুলোর ছবি/ভিডিও লিস্ট নেবে"""
     html_text = html_content if html_content and html_content.strip() else HTML_CONTENT
     if not html_text or not html_text.strip():
         return SITE_NAME, []
@@ -245,7 +232,6 @@ def extract_albums(html_content):
     by_containers = _finalize_albums(_strategy_containers(soup))
     by_headings = _finalize_albums(_strategy_headings(soup))
 
-    # যে পদ্ধতিতে অ্যালবামগুলো সবচেয়ে ভালোভাবে আলাদা হয়েছে সেটি বেছে নেওয়া
     if len(by_containers) >= 2 and len(by_containers) >= len(by_headings):
         return page_title, by_containers
     if len(by_headings) >= 2:
@@ -255,27 +241,37 @@ def extract_albums(html_content):
     if by_headings:
         return page_title, by_headings
 
-    # কোনো অ্যালবাম ট্যাগ না থাকলে পুরো পেজের সব মিডিয়া নিয়ে অ্যালবাম তৈরি করা
     all_items = list(iter_scope_media(soup))
     return page_title, _finalize_albums([{"title": page_title, "items": all_items}])
 
 
-# ================= ২০-৩০ মিনিটের বড় ভিডিও ও 403 বাইপাস ডাউনলোডার =================
+# ================= কুকি ও 403 বাইপাস ডাউনলোডার =================
 async def custom_download(url, dest_path, state=None, progress_cb=None, max_bytes=None):
-    """
-    cdn.mmsdesi.me এর HTTP 403 Forbidden এরর বাইপাস করে এবং
-    ২০-৩০ মিনিটের বড় ভিডিও কোনো টাইমআউট ছাড়াই ডাউনলোড করে।
-    """
     parsed = urlparse(url)
     origin_host = f"{parsed.scheme}://{parsed.netloc}"
 
-    # 403 এড়াতে একাধিক সম্ভাব্য Referer প্রোফাইল
+    user_cookie = (
+        "_ga=GA1.1.2033937358.1793779443; "
+        "dom3ic8zudi28v8lr6fgphwffqoz0j6c=01a1a596-297f-73bb-aeee-f1c73ed0e533; "
+        "vrk4n8fqhwc3jzy7pbsmgt6dx5lha2u9=01a1a596-297f-73bb-aeee-f1c73ed0e533_2; "
+        "__suvt=8-941b13b1ea7495daf71fbc63d20ee1e8; "
+        "imprCounter_df944f9c7362c951eeb70e2971549a1e_expiry=Invalid Date; "
+        "__nuvt=8-bd41f605fc8e6ad4aac8296ad99bf260; "
+        "imprCounter_1ce633f4a79ad1403e907714d91f9b70_expiry=Invalid Date; "
+        "imprCounter_5ca152d2a83beebf9923e476b98919cb_expiry=Invalid Date; "
+        "imprCounter_df944f9c7362c951eeb70e2971549a1e=4; "
+        "imprCounter_1ce633f4a79ad1403e907714d91f9b70=5; "
+        "imprCounter_5ca152d2a83beebf9923e476b98919cb=2; "
+        "_ga_PQR73V6M37=GS2.1.s1793779443$o1$g1$t1793779621$j60$l0$h0; "
+        "sb_main_91b7e623af01664a963f1516a146e8b0=1; "
+        "sb_count_91b7e623af01664a963f1516a146e8b0=1"
+    )
+
     referer_profiles = [
         {"Referer": "https://mmsdesi.me/", "Origin": "https://mmsdesi.me"},
         {"Referer": "https://www.mmsdesi.me/", "Origin": "https://www.mmsdesi.me"},
-        {"Referer": "https://mmsdesi.com/", "Origin": "https://mmsdesi.com"},
-        {"Referer": f"{origin_host}/"},
-        {}  # Referer ছাড়া চেষ্টা
+        {f"{origin_host}/"},
+        {}
     ]
 
     base_headers = {
@@ -287,6 +283,7 @@ async def custom_download(url, dest_path, state=None, progress_cb=None, max_byte
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
+        "Cookie": user_cookie,
         "Sec-Fetch-Dest": "video",
         "Sec-Fetch-Mode": "no-cors",
         "Sec-Fetch-Site": "cross-site",
@@ -302,7 +299,6 @@ async def custom_download(url, dest_path, state=None, progress_cb=None, max_byte
         headers.update(extra_hdr)
 
         try:
-            # total=None দেওয়ায় ২০-৩০ মিনিটের বড় ভিডিও ডাউনলোডে কখনো টাইমআউট হবে না
             timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
             async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
                 async with session.get(url, allow_redirects=True) as resp:
