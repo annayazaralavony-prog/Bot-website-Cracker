@@ -4,10 +4,14 @@ import sqlite3
 import asyncio
 import traceback
 import aiohttp
+import time
+import glob
+import html as htmllib
+from urllib.parse import urlparse
 from datetime import datetime, timezone
 from threading import Thread
 from flask import Flask
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag, NavigableString
 
 # ================= Python 3.14 Event Loop Fix =================
 try:
@@ -15,10 +19,11 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters, idle, enums
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    InputMediaVideo, InputMediaPhoto
 )
 from pyrogram.errors import FloodWait, RPCError
 
@@ -404,9 +409,19 @@ def make_site_name(title):
         name = "Website"
     return name[:30]
 
+def albums_panel_text(albums):
+    v_total, p_total = album_totals(albums)
+    text = (
+        f"📁 **Albums Detected:** `{len(albums)}`\n"
+        f"🎬 **Videos:** `{v_total}` | 🖼️ **Photos:** `{p_total}`\n"
+    )
+    if albums:
+        text += f"\n```text\n{describe_albums(albums)}\n```\n"
+    return text
+
 async def register_site(client, user_id, html_content, hashtag):
     """HTML সেভ করে মেনু বাটনে সাইটের নাম যোগ করে (তখনই স্ক্যান করে না)"""
-    title, videos, images = extract_media_from_html(html_content)
+    title, albums = extract_albums(html_content)
     name = make_site_name(title)
     site_id = save_site(user_id, name, hashtag, html_content)
 
@@ -418,26 +433,24 @@ async def register_site(client, user_id, html_content, hashtag):
     await update_panel(
         client, user_id,
         f"✅ **Website Saved**\n\n"
-        f"🌐 **Name:** `{name}`\n"
+        f"🌐 **Name:** `{safe(name)}`\n"
         f"🏷️ **Hashtag:** `{hashtag}`\n"
-        f"🎬 **Videos Found:** `{len(videos)}`\n"
-        f"🖼️ **Images Found:** `{len(images)}`\n\n"
+        f"{albums_panel_text(albums)}\n"
         f"মেসেজ বক্সের পাশের মেনু বাটনে সাইটের নাম যোগ হয়েছে। এখনই স্ক্যান করতে নিচের বাটনে ক্লিক করুন:",
         get_site_keyboard(site_id)
     )
 
 async def show_site_panel(client, user_id, site):
-    site_id, name, hashtag, html = site
-    _t, videos, images = extract_media_from_html(html)
+    site_id, name, hashtag, html_content = site
+    _t, albums = extract_albums(html_content)
     user_sessions.setdefault(user_id, {})["state"] = "IDLE"
     await reset_panel(client, user_id)
     await update_panel(
         client, user_id,
-        f"🌐 **{name}**\n\n"
+        f"🌐 **{safe(name)}**\n\n"
         f"🏷️ **Hashtag:** `{hashtag}`\n"
-        f"🎬 **Videos Found:** `{len(videos)}`\n"
-        f"🖼️ **Images Found:** `{len(images)}`\n\n"
-        f"ওয়েবসাইট থেকে ভিডিও ও ছবি স্ক্যান করে আপলোড করতে নিচের বাটনে ক্লিক করুন:",
+        f"{albums_panel_text(albums)}\n"
+        f"অ্যালবাম বাই অ্যালবাম ভিডিও ও ছবি স্ক্যান করে আপলোড করতে নিচের বাটনে ক্লিক করুন:",
         get_site_keyboard(site_id)
     )
 
@@ -593,9 +606,21 @@ async def handle_callbacks(client, cq):
                 await cq.answer("⚠️ Website not found. Please add it again.", show_alert=True)
                 return
             _id, name, hashtag, html = site
+            started = await start_scan(client, user_id, html, hashtag, site_id)
+            if not started:
+                await cq.answer("⚠️ A scan is already running. Use Cancel Scan first.", show_alert=True)
+                return
             user_sessions[user_id]["state"] = "PROCESSING"
-            await cq.answer("Scanning website...")
-            await process_and_upload(client, user_id, html, hashtag)
+            await cq.answer("Scan started")
+            return
+
+        elif data == "scan_cancel":
+            st = active_scans.get(user_id)
+            if st and not st["task"].done():
+                st["cancel"] = True
+                await cq.answer("Stopping scan... please wait a moment.")
+            else:
+                await cq.answer("No scan is running.", show_alert=True)
             return
 
         elif data.startswith("site_del_"):
@@ -727,239 +752,626 @@ async def handle_document_input(client, message):
             get_home_keyboard()
         )
 
-# ================= স্ক্যান, ডাউনলোড ও আপলোড লজিক =================
-def extract_media_from_html(html_content):
+# ================= অ্যালবাম স্ক্যান, ডাউনলোড ও আপলোড লজিক =================
+MP4_RE = re.compile(r'https?://[^\s"\'<>]+?\.mp4(?:\?[^\s"\'<>]*)?', re.IGNORECASE)
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+IGNORE_IMG_RE = re.compile(r"(?<![a-z])(logo|icon|avatar|banner|ads?|pixel|sprite|emoji|favicon)(?![a-z])", re.IGNORECASE)
+ALBUM_CLASS_RE = re.compile(r"album|gallery|folder|collection", re.IGNORECASE)
+HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "summary"]
+MAX_ALBUM_BATCH = 10  # টেলিগ্রাম একটি অ্যালবামে সর্বোচ্চ ১০টি ফাইল নেয়
+MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "2000")) * 1024 * 1024    # টেলিগ্রামের ২GB সীমা
+MAX_BATCH_BYTES = int(os.environ.get("MAX_BATCH_MB", "1200")) * 1024 * 1024  # একসাথে ডিস্কে জমা রাখার সীমা
+
+class ScanCancelled(BaseException):
+    """ইউজার Cancel চাপলে এটা রেইজ হয় (BaseException, যাতে সাধারণ except এ আটকে না যায়)"""
+    pass
+
+active_scans = {}  # user_id -> {"cancel": bool, "task": Task}
+
+def get_cancel_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancel Scan", callback_data="scan_cancel")]])
+
+def safe(text):
+    return str(text).replace("`", "'")
+
+def check_cancel(state):
+    if state and state.get("cancel"):
+        raise ScanCancelled()
+
+async def cancellable_sleep(seconds, state):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        check_cancel(state)
+        await asyncio.sleep(min(1, max(0, end - time.monotonic())))
+
+async def run_cancellable(coro, state):
+    """কোনো কাজ চলার সময় Cancel চাপলে সেটা মাঝপথে বন্ধ করে দেয়"""
+    task = asyncio.ensure_future(coro)
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=1)
+            if state.get("cancel") and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise ScanCancelled()
+        return task.result()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+
+# ---------- HTML থেকে অ্যালবাম বের করার লজিক ----------
+def _first_http(tag, attrs):
+    for a in attrs:
+        v = tag.get(a)
+        if isinstance(v, str) and v.strip().startswith("http"):
+            return v.strip()
+    return None
+
+def classify_tag(tag):
+    """একটি ট্যাগ ভিডিও/ছবি হলে ("video"/"image", url) রিটার্ন করে"""
+    for val in tag.attrs.values():
+        if isinstance(val, str) and ".mp4" in val.lower():
+            m = MP4_RE.search(val)
+            if m:
+                return ("video", htmllib.unescape(m.group(0)))
+
+    if tag.name == "img":
+        parent = tag.parent
+        # ভিডিওর থাম্বনেইল (mp4 লিংকের ভিতরের ছবি) বাদ
+        if parent is not None and parent.name == "a" and ".mp4" in (parent.get("href") or "").lower():
+            return None
+        url = _first_http(tag, ("src", "data-src", "data-original", "data-lazy-src"))
+    elif tag.name == "a":
+        url = _first_http(tag, ("href",))
+    else:
+        return None
+
+    if not url:
+        return None
+    path = urlparse(url).path.lower()
+    if not path.endswith(IMG_EXTS):
+        return None
+    if IGNORE_IMG_RE.search(url.lower()):
+        return None
+    return ("image", url)
+
+def iter_scope_media(scope):
+    for node in scope.descendants:
+        if isinstance(node, Tag):
+            r = classify_tag(node)
+            if r:
+                yield r
+        elif isinstance(node, NavigableString):
+            if node.parent is not None and node.parent.name in ("script", "noscript"):
+                for u in MP4_RE.findall(str(node)):
+                    yield ("video", htmllib.unescape(u))
+
+def _clean_title(text):
+    t = re.sub(r"\s+", " ", text or "").strip()
+    return t[:150] if t else None
+
+def find_album_title(container):
+    h = container.find(HEADING_TAGS)
+    if h is not None:
+        t = _clean_title(h.get_text(" ", strip=True))
+        if t:
+            return t
+    el = container.find(class_=re.compile(r"title|name|caption", re.IGNORECASE))
+    if el is not None:
+        t = _clean_title(el.get_text(" ", strip=True))
+        if t:
+            return t
+    for attr in ("data-title", "title", "aria-label", "data-name"):
+        v = container.get(attr)
+        if isinstance(v, str) and _clean_title(v):
+            return _clean_title(v)
+    sib = container.find_previous_sibling()
+    for _ in range(2):
+        if sib is None:
+            break
+        if sib.name in HEADING_TAGS:
+            t = _clean_title(sib.get_text(" ", strip=True))
+            if t:
+                return t
+        sib = sib.find_previous_sibling()
+    return None
+
+def _strategy_containers(soup):
+    """class/id তে album, gallery, folder, collection থাকা ব্লক = এক একটি অ্যালবাম"""
+    cands = []
+    for t in soup.find_all(["div", "section", "article", "li", "details", "figure", "ul"]):
+        cid = " ".join(t.get("class") or []) + " " + (t.get("id") or "")
+        if ALBUM_CLASS_RE.search(cid):
+            cands.append(t)
+    with_media = []
+    for t in cands:
+        items = list(iter_scope_media(t))
+        if items:
+            with_media.append((t, items))
+    ids = {id(t) for t, _ in with_media}
+    albums = []
+    for t, items in with_media:
+        if t.find(lambda x: id(x) in ids):
+            continue  # ভিতরে আরও ছোট অ্যালবাম ব্লক আছে, তাই এটা র‍্যাপার
+        albums.append({"title": find_album_title(t), "items": items})
+    return albums
+
+def _strategy_headings(soup):
+    """হেডিং (h1-h6) থেকে পরের হেডিং পর্যন্ত সব মিডিয়া = এক একটি অ্যালবাম"""
+    albums = []
+    cur = None
+    root = soup.body or soup
+    for node in root.descendants:
+        if isinstance(node, Tag):
+            if node.name in HEADING_TAGS:
+                text = _clean_title(node.get_text(" ", strip=True))
+                if text:
+                    cur = {"title": text, "items": []}
+                    albums.append(cur)
+                continue
+            r = classify_tag(node)
+            if r and cur is not None:
+                cur["items"].append(r)
+        elif isinstance(node, NavigableString):
+            if cur is not None and node.parent is not None and node.parent.name in ("script", "noscript"):
+                for u in MP4_RE.findall(str(node)):
+                    cur["items"].append(("video", htmllib.unescape(u)))
+    return albums
+
+def _finalize(albums):
+    out = []
+    for a in albums:
+        seen = set()
+        items = []
+        for kind, url in a["items"]:
+            if url in seen:
+                continue
+            seen.add(url)
+            items.append((kind, url))
+        if items:
+            out.append({"title": a.get("title") or f"Album {len(out) + 1}", "items": items})
+    return out
+
+def extract_albums(html_content):
+    """রিটার্ন: (page_title, [ {"title": str, "items": [(kind, url), ...]}, ... ])"""
     soup = BeautifulSoup(html_content, "html.parser")
     page_title = soup.title.string.strip() if soup.title and soup.title.string else "Website Media"
 
-    videos = set()
-    images = set()
+    a_albums = _finalize(_strategy_containers(soup))
+    if len(a_albums) >= 2:
+        return page_title, a_albums
 
-    raw_mp4s = re.findall(r'https?://[^\s"\'<>]+?\.mp4(?:\?[^\s"\'<>]*)?', html_content, re.IGNORECASE)
-    for v in raw_mp4s:
-        videos.add(v)
+    b_albums = _finalize(_strategy_headings(soup))
+    if len(b_albums) >= 2:
+        return page_title, b_albums
+    if a_albums:
+        return page_title, a_albums
+    if b_albums:
+        return page_title, b_albums
 
-    for tag in soup.find_all(["video", "source", "a", "img"]):
-        url = tag.get("src") or tag.get("data-src") or tag.get("href")
-        if not url or not url.startswith("http"):
-            continue
-        low_url = url.lower()
-        if ".mp4" in low_url:
-            videos.add(url)
-        elif any(ext in low_url for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-            if not any(ignore in low_url for ignore in ["logo", "icon", "avatar", "banner", "ads", "pixel"]):
-                images.add(url)
+    whole = _finalize([{"title": page_title, "items": list(iter_scope_media(soup))}])
+    return page_title, whole
 
-    return page_title, list(videos), list(images)
+def album_totals(albums):
+    v = sum(1 for a in albums for k, _ in a["items"] if k == "video")
+    p = sum(1 for a in albums for k, _ in a["items"] if k == "image")
+    return v, p
 
-async def download_file_with_details(url, dest_path):
+def describe_albums(albums, limit=10):
+    lines = []
+    for i, a in enumerate(albums[:limit], start=1):
+        v = sum(1 for k, _ in a["items"] if k == "video")
+        p = len(a["items"]) - v
+        lines.append(f"{i}. {safe(a['title'])[:32]} - {v}V {p}P")
+    if len(albums) > limit:
+        lines.append(f"...and {len(albums) - limit} more albums")
+    return "\n".join(lines)
+
+# ---------- ডাউনলোড ----------
+def url_ext(url, kind):
+    path = urlparse(url).path.lower()
+    for e in (".mp4", ".jpg", ".jpeg", ".png", ".webp"):
+        if path.endswith(e):
+            return e
+    return ".mp4" if kind == "video" else ".jpg"
+
+async def download_file_with_details(url, dest_path, state=None, progress_cb=None, max_bytes=None):
+    parsed = urlparse(url)
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": f"{parsed.scheme}://{parsed.netloc}/"
     }
-    try:
-        timeout = aiohttp.ClientTimeout(total=1200)
-        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return False, f"HTTP Error {resp.status} ({resp.reason}) - Server blocked or file removed."
+    last_err = "Unknown error"
+    for attempt in range(1, 4):
+        try:
+            # মোট সময়ের সীমা নেই (৩০-৬০ মিনিটের ভিডিও চলবে); ৫ মিনিট কোনো ডাটা না এলে টাইমআউট
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return False, f"HTTP Error {resp.status} ({resp.reason}) - Server blocked or file removed."
 
-                with open(dest_path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(1024 * 1024):
-                        f.write(chunk)
+                    total = resp.content_length or 0
+                    if max_bytes and total and total > max_bytes:
+                        return False, f"File too large ({total // (1024 * 1024)} MB, limit {max_bytes // (1024 * 1024)} MB)."
 
-                if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
-                    return False, "Downloaded file is 0 bytes (Empty response)."
+                    downloaded = 0
+                    last_cb = time.monotonic()
+                    with open(dest_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(1024 * 1024):
+                            if state and state.get("cancel"):
+                                raise ScanCancelled()
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if max_bytes and downloaded > max_bytes:
+                                return False, "File exceeds the Telegram size limit."
+                            if progress_cb and time.monotonic() - last_cb >= 4:
+                                last_cb = time.monotonic()
+                                try:
+                                    await progress_cb(downloaded, total)
+                                except Exception:
+                                    pass
 
-                return True, "OK"
+            if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+                return False, "Downloaded file is 0 bytes (Empty response)."
+            return True, "OK"
 
-    except asyncio.TimeoutError:
-        return False, "Connection Timeout: Server took too long to respond (>20 mins)."
-    except aiohttp.ClientConnectorError as e:
-        return False, f"DNS/Connection Error: Cannot connect to host ({str(e)})."
-    except Exception as e:
-        return False, f"{type(e).__name__}: {str(e)}"
+        except asyncio.TimeoutError:
+            last_err = "Connection Timeout: no data received for 5 minutes."
+        except aiohttp.ClientConnectorError as e:
+            last_err = f"DNS/Connection Error: Cannot connect to host ({str(e)})."
+        except aiohttp.ClientError as e:
+            last_err = f"{type(e).__name__}: {str(e)}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {str(e)}"
 
-async def upload_to_channel(file_path, caption, is_video=True):
-    """Telethon Session থাকলে সেটি দিয়ে আপলোড করবে, না থাকলে বট দিয়ে আপলোড করবে"""
-    t_ok, t_err = await ensure_telethon_connected()
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        await cancellable_sleep(3 * attempt, state)
+
+    return False, f"{last_err} (failed after 3 attempts)"
+
+# ---------- আপলোড ----------
+def build_caption(title, a_idx, total_albums, part, multi_part, hashtag):
+    cap = f"<b>{htmllib.escape(title[:200])}</b>\n📁 Album {a_idx}/{total_albums}"
+    if multi_part:
+        cap += f" • Part {part}"
+    cap += f"\n{htmllib.escape(hashtag)}"
+    return cap
+
+async def send_album(files, caption):
+    """files: [{"path","kind","url"}] — ২ বা তার বেশি হলে অ্যালবাম আকারে, ১টি হলে সিঙ্গেল পোস্ট"""
+    t_ok, _ = await ensure_telethon_connected()
+    paths = [f["path"] for f in files]
+
     if t_ok:
-        await telethon_client.send_file(
-            STORAGE_CHANNEL_ID,
-            file_path,
-            caption=caption,
-            supports_streaming=is_video
-        )
-    else:
-        if is_video:
-            await bot.send_video(
-                chat_id=STORAGE_CHANNEL_ID,
-                video=file_path,
-                caption=caption,
-                supports_streaming=True
+        if len(paths) == 1:
+            await telethon_client.send_file(
+                STORAGE_CHANNEL_ID, paths[0],
+                caption=caption or None, parse_mode="html",
+                supports_streaming=(files[0]["kind"] == "video")
             )
         else:
-            await bot.send_photo(
-                chat_id=STORAGE_CHANNEL_ID,
-                photo=file_path,
-                caption=caption
+            caps = [caption] + [""] * (len(paths) - 1)
+            await telethon_client.send_file(
+                STORAGE_CHANNEL_ID, paths,
+                caption=caps, parse_mode="html",
+                supports_streaming=True
             )
+    else:
+        if len(files) == 1:
+            f = files[0]
+            if f["kind"] == "video":
+                await bot.send_video(
+                    STORAGE_CHANNEL_ID, video=f["path"], caption=caption,
+                    parse_mode=enums.ParseMode.HTML, supports_streaming=True
+                )
+            else:
+                await bot.send_photo(
+                    STORAGE_CHANNEL_ID, photo=f["path"], caption=caption,
+                    parse_mode=enums.ParseMode.HTML
+                )
+        else:
+            media = []
+            for i, f in enumerate(files):
+                cap = caption if i == 0 else ""
+                if f["kind"] == "video":
+                    media.append(InputMediaVideo(f["path"], caption=cap, parse_mode=enums.ParseMode.HTML, supports_streaming=True))
+                else:
+                    media.append(InputMediaPhoto(f["path"], caption=cap, parse_mode=enums.ParseMode.HTML))
+            await bot.send_media_group(STORAGE_CHANNEL_ID, media)
 
-async def process_and_upload(client, user_id, html_content, hashtag):
+async def send_with_flood_retry(files, caption, state):
+    for _ in range(3):
+        try:
+            await run_cancellable(send_album(files, caption), state)
+            return
+        except (FloodWait, FloodWaitError) as fw:
+            wait_sec = int(getattr(fw, "value", getattr(fw, "seconds", 10)) or 10)
+            await cancellable_sleep(min(wait_sec + 1, 600), state)
+    raise RuntimeError("Too many FloodWait retries")
+
+async def send_batch(files, caption, state):
+    """অ্যালবাম সেন্ড করে। ব্যর্থ হলে ফাইলগুলো একটি একটি করে পাঠানোর চেষ্টা করে। রিটার্ন: (ok_files, [(url, error)])"""
     try:
-        await update_panel(client, user_id, "🔍 **Scanning Website...**\nExtracting video and image links...")
-        title, videos, images = extract_media_from_html(html_content)
+        await send_with_flood_retry(files, caption, state)
+        return list(files), []
+    except ScanCancelled:
+        raise
+    except Exception as first_err:
+        if len(files) == 1:
+            return [], [(files[0]["url"], f"{type(first_err).__name__}: {first_err}")]
+        ok_files, failed = [], []
+        captioned = False
+        for f in files:
+            try:
+                await send_with_flood_retry([f], "" if captioned else caption, state)
+                captioned = True
+                ok_files.append(f)
+            except ScanCancelled:
+                raise
+            except Exception as e:
+                failed.append((f["url"], f"{type(e).__name__}: {e}"))
+        return ok_files, failed
 
-        if not videos and not images:
+async def upload_album_batch(batch, title, a_idx, total_albums, part, multi_part, hashtag, state):
+    caption = build_caption(title, a_idx, total_albums, part, multi_part, hashtag)
+    try:
+        ok_files, failed = await send_batch(batch, caption, state)
+    finally:
+        for f in batch:
+            if os.path.exists(f["path"]):
+                os.remove(f["path"])
+    for f in ok_files:
+        mark_as_uploaded(f["url"], hashtag)
+    return ok_files, failed
+
+def tally(ok_files, failed, a_idx):
+    v = sum(1 for f in ok_files if f["kind"] == "video")
+    p = len(ok_files) - v
+    errs = [f"• [Album {a_idx} Upload Failed]\n  URL: {u[:45]}...\n  Reason: {e}" for u, e in failed]
+    return v, p, errs
+
+async def send_channel_text(text_html):
+    try:
+        t_ok, _ = await ensure_telethon_connected()
+        if t_ok:
+            await telethon_client.send_message(STORAGE_CHANNEL_ID, text_html, parse_mode="html")
+        else:
+            await bot.send_message(STORAGE_CHANNEL_ID, text_html, parse_mode=enums.ParseMode.HTML)
+    except Exception as e:
+        print(f"⚠️ Could not send album report to channel: {type(e).__name__}: {e}")
+
+# ---------- স্ক্যান শুরু (ব্যাকগ্রাউন্ড টাস্ক) ----------
+async def start_scan(client, user_id, html_content, hashtag, site_id=None):
+    old = active_scans.get(user_id)
+    if old and not old["task"].done():
+        return False
+    state = {"cancel": False}
+    task = asyncio.create_task(process_and_upload(client, user_id, html_content, hashtag, state, site_id))
+    state["task"] = task
+    active_scans[user_id] = state
+    return True
+
+async def process_and_upload(client, user_id, html_content, hashtag, state=None, site_id=None):
+    if state is None:
+        state = {"cancel": False}
+    end_kb = get_site_keyboard(site_id) if site_id else get_home_keyboard()
+    cancel_kb = get_cancel_keyboard()
+
+    up_v = up_p = skipped = albums_done = albums_skipped = 0
+    errors = []
+    cancelled = False
+    fatal = False
+    title = "Website"
+    total_albums = 0
+    uploader_mode = "Pyrogram Bot Token"
+    ctx = {"a_idx": 0, "title": ""}
+
+    def progress_text(action, extra=""):
+        return (
+            f"⏳ **Scanning Albums**\n\n"
+            f"⚡ **Engine:** `{uploader_mode}`\n"
+            f"📁 **Album:** `{ctx['a_idx']}/{total_albums}` - `{safe(ctx['title'])[:40]}`\n"
+            f"{action}\n"
+            f"{extra}"
+            f"✅ **Uploaded:** `{up_v} videos, {up_p} photos` | ❌ **Failed:** `{len(errors)}`"
+        )
+
+    try:
+        await update_panel(client, user_id, "🔍 **Scanning Website...**\nDetecting albums, photos and videos...", cancel_kb)
+        title, albums = extract_albums(html_content)
+        total_albums = len(albums)
+
+        if not albums:
             await update_panel(
                 client, user_id,
                 "⚠️ **NO MEDIA FOUND IN HTML**\n\n"
                 "**Diagnostic Report (English):**\n"
                 f"• `Total HTML Length:` `{len(html_content)} chars`\n"
-                "• `Direct .mp4 Links:` `0 found`\n"
-                "• `Valid Image Links:` `0 found`\n"
+                "• `Albums Detected:` `0`\n"
                 "• **Possible Cause:** The website might be loading videos dynamically via encrypted JavaScript (m3u8/blob) or requires login cookies.",
-                get_home_keyboard()
+                end_kb
             )
-            user_sessions.setdefault(user_id, {})["state"] = "IDLE"
-            return
-
-        new_videos = [v for v in videos if not is_duplicate(v)]
-        new_images = [img for img in images if not is_duplicate(img)]
-
-        if not new_videos and not new_images:
-            await update_panel(
-                client, user_id,
-                "ℹ️ **ALL MEDIA ALREADY UPLOADED (DUPLICATES)**\n\n"
-                f"• **Found Videos:** `{len(videos)}` (All skipped as duplicates)\n"
-                f"• **Found Images:** `{len(images)}` (All skipped as duplicates)\n"
-                f"• **Database Status:** Already exists in `uploaded_media` table.",
-                get_home_keyboard()
-            )
-            user_sessions.setdefault(user_id, {})["state"] = "IDLE"
             return
 
         t_ok, _ = await ensure_telethon_connected()
         uploader_mode = "Telethon User Session" if t_ok else "Pyrogram Bot Token"
+        seen_run = set()
 
-        uploaded_vids = 0
-        uploaded_imgs = 0
-        error_logs = []
+        for a_idx, album in enumerate(albums, start=1):
+            check_cancel(state)
+            ctx["a_idx"] = a_idx
+            ctx["title"] = album["title"]
 
-        # ১. ভিডিও আপলোড লুপ
-        for idx, v_url in enumerate(new_videos, start=1):
-            temp_vid = f"temp_vid_{user_id}_{idx}.mp4"
-            await update_panel(
-                client, user_id,
-                f"⏳ **Processing Media (Single Panel View)**\n\n"
-                f"⚡ **Uploader Engine:** `{uploader_mode}`\n"
-                f"📌 **Title:** `{title[:40]}`\n"
-                f"🏷️ **Hashtag:** `{hashtag}`\n"
-                f"⬇️ **Action:** `Downloading Video ({idx}/{len(new_videos)})`\n"
-                f"🔗 **URL:** `{v_url[:50]}...`\n"
-                f"✅ **Uploaded:** `{uploaded_vids} Videos` | ❌ **Failed:** `{len(error_logs)}`"
-            )
+            all_items = album["items"]
+            v_found = sum(1 for k, _ in all_items if k == "video")
+            p_found = len(all_items) - v_found
 
-            ok, err_reason = await download_file_with_details(v_url, temp_vid)
-            if not ok:
-                error_logs.append(f"• [Video #{idx} Download Failed]\n  URL: {v_url[:45]}...\n  Reason: {err_reason}")
-                if os.path.exists(temp_vid):
-                    os.remove(temp_vid)
+            items = []
+            prev_v = prev_p = 0
+            for kind, url in all_items:
+                if is_duplicate(url):
+                    skipped += 1
+                    if kind == "video":
+                        prev_v += 1
+                    else:
+                        prev_p += 1
+                    continue
+                if url in seen_run:
+                    continue
+                seen_run.add(url)
+                items.append((kind, url))
+
+            if not items:
+                albums_skipped += 1
                 continue
 
-            try:
+            batch = []
+            batch_bytes = 0
+            part = 0
+            a_up_v = a_up_p = a_fail = 0
+
+            async def flush(batch_list, part_no):
+                mb = sum(f["size"] for f in batch_list) // (1024 * 1024)
                 await update_panel(
                     client, user_id,
-                    f"⏳ **Processing Media (Single Panel View)**\n\n"
-                    f"⚡ **Uploader Engine:** `{uploader_mode}`\n"
-                    f"⬆️ **Action:** `Uploading Video to Storage Channel ({idx}/{len(new_videos)})`\n"
-                    f"📦 **File Size:** `{os.path.getsize(temp_vid) // (1024*1024)} MB`\n"
-                    f"✅ **Uploaded:** `{uploaded_vids} Videos` | ❌ **Failed:** `{len(error_logs)}`"
+                    progress_text(f"⬆️ **Uploading Album Part {part_no}:** `{len(batch_list)} files, {mb} MB`"),
+                    cancel_kb
                 )
-                caption = f"🎬 **{title}**\n\n{hashtag} #website"
-                await upload_to_channel(temp_vid, caption, is_video=True)
-                mark_as_uploaded(v_url, hashtag)
-                uploaded_vids += 1
-                await asyncio.sleep(3)
-
-            except (FloodWait, FloodWaitError) as fw:
-                wait_sec = getattr(fw, "value", getattr(fw, "seconds", 10))
-                error_logs.append(f"• [Video #{idx} FloodWait]\n  Waited {wait_sec}s, file skipped (scan again to retry).")
-                await asyncio.sleep(wait_sec)
-            except (RPCError, TelethonRPCError) as rpc_err:
-                error_logs.append(
-                    f"• [Video #{idx} Telegram API Error]\n"
-                    f"  Type: {type(rpc_err).__name__}\n"
-                    f"  Reason: {str(rpc_err)} (Check STORAGE_CHANNEL_ID & Permissions)"
+                ok_files, failed = await upload_album_batch(
+                    batch_list, album["title"], a_idx, total_albums, part_no,
+                    len(items) > MAX_ALBUM_BATCH or part_no > 1, hashtag, state
                 )
-            except Exception as up_err:
-                error_logs.append(f"• [Video #{idx} Upload Error]\n  Reason: {type(up_err).__name__} - {str(up_err)}")
-            finally:
-                if os.path.exists(temp_vid):
-                    os.remove(temp_vid)
-
-        # ২. ছবি আপলোড লুপ
-        for idx, img_url in enumerate(new_images, start=1):
-            temp_img = f"temp_img_{user_id}_{idx}.jpg"
-            await update_panel(
-                client, user_id,
-                f"⏳ **Processing Images via {uploader_mode}...**\n\n"
-                f"🖼️ **Progress:** `{idx}/{len(new_images)}`\n"
-                f"✅ **Videos Done:** `{uploaded_vids}` | **Images Done:** `{uploaded_imgs}`\n"
-                f"❌ **Errors Logged:** `{len(error_logs)}`"
-            )
-
-            ok, err_reason = await download_file_with_details(img_url, temp_img)
-            if not ok:
-                error_logs.append(f"• [Image #{idx} Download Failed]\n  URL: {img_url[:45]}...\n  Reason: {err_reason}")
-                if os.path.exists(temp_img):
-                    os.remove(temp_img)
-                continue
+                return tally(ok_files, failed, a_idx)
 
             try:
-                caption = f"🖼️ **{title}**\n\n{hashtag} #website"
-                await upload_to_channel(temp_img, caption, is_video=False)
-                mark_as_uploaded(img_url, hashtag)
-                uploaded_imgs += 1
-                await asyncio.sleep(2)
-            except Exception as up_err:
-                error_logs.append(f"• [Image #{idx} Upload Error]\n  Reason: {type(up_err).__name__} - {str(up_err)}")
+                for item_idx, (kind, url) in enumerate(items, start=1):
+                    check_cancel(state)
+                    label = "Video" if kind == "video" else "Photo"
+                    temp = f"tmp_{user_id}_{a_idx}_{item_idx}{url_ext(url, kind)}"
+
+                    await update_panel(
+                        client, user_id,
+                        progress_text(
+                            f"⬇️ **Downloading {label}:** `{item_idx}/{len(items)}`",
+                            f"🔗 `{safe(url[:50])}...`\n"
+                        ),
+                        cancel_kb
+                    )
+
+                    async def progress(downloaded, total):
+                        pct = f" ({downloaded * 100 // total}%)" if total else ""
+                        size_txt = f"{downloaded // (1024 * 1024)} MB" + (f" / {total // (1024 * 1024)} MB" if total else "")
+                        await update_panel(
+                            client, user_id,
+                            progress_text(
+                                f"⬇️ **Downloading {label}:** `{item_idx}/{len(items)}`",
+                                f"📦 `{size_txt}{pct}`\n"
+                            ),
+                            cancel_kb
+                        )
+
+                    ok, err = await download_file_with_details(url, temp, state, progress, MAX_FILE_BYTES)
+                    if not ok:
+                        errors.append(f"• [Album {a_idx} {label} #{item_idx} Download Failed]\n  URL: {url[:45]}...\n  Reason: {err}")
+                        a_fail += 1
+                        if os.path.exists(temp):
+                            os.remove(temp)
+                        continue
+
+                    size = os.path.getsize(temp)
+                    batch.append({"path": temp, "kind": kind, "url": url, "size": size})
+                    batch_bytes += size
+
+                    if len(batch) >= MAX_ALBUM_BATCH or batch_bytes >= MAX_BATCH_BYTES:
+                        part += 1
+                        to_send = batch
+                        batch = []
+                        batch_bytes = 0
+                        v, p, errs = await flush(to_send, part)
+                        a_up_v += v; a_up_p += p; up_v += v; up_p += p
+                        a_fail += len(errs); errors.extend(errs)
+                        await cancellable_sleep(2, state)
+
+                if batch:
+                    part += 1
+                    to_send = batch
+                    batch = []
+                    v, p, errs = await flush(to_send, part)
+                    a_up_v += v; a_up_p += p; up_v += v; up_p += p
+                    a_fail += len(errs); errors.extend(errs)
             finally:
-                if os.path.exists(temp_img):
-                    os.remove(temp_img)
+                for f in batch:
+                    if os.path.exists(f["path"]):
+                        os.remove(f["path"])
 
-        # ৩. চূড়ান্ত রিপোর্ট
-        summary_text = (
-            f"🏁 **TASK COMPLETED REPORT**\n\n"
-            f"⚡ **Engine Used:** `{uploader_mode}`\n"
-            f"📌 **Page Title:** `{title[:45]}`\n"
-            f"🏷️ **Section Tag:** `{hashtag}`\n"
-            f"🎬 **Videos Uploaded:** `{uploaded_vids}/{len(new_videos)}`\n"
-            f"🖼️ **Images Uploaded:** `{uploaded_imgs}/{len(new_images)}`\n"
-            f"❌ **Total Failed:** `{len(error_logs)}`\n"
-        )
+            # অ্যালবাম সম্পূর্ণ হলে চ্যানেলে ইংরেজিতে রিপোর্ট
+            report = (
+                f"✅ <b>Album {a_idx}/{total_albums} completed</b>\n"
+                f"📁 {htmllib.escape(album['title'][:200])}\n"
+                f"🎬 Videos: {a_up_v + prev_v}/{v_found}\n"
+                f"🖼️ Photos: {a_up_p + prev_p}/{p_found}\n"
+                f"📦 Total files in album: {len(all_items)}"
+            )
+            if a_fail:
+                report += f"\n⚠️ Failed: {a_fail}"
+            await send_channel_text(report)
+            albums_done += 1
+            await cancellable_sleep(2, state)
 
-        if error_logs:
-            joined_errors = "\n".join(error_logs[:8])
-            if len(error_logs) > 8:
-                joined_errors += f"\n...and {len(error_logs) - 8} more errors."
-            summary_text += f"\n⚠️ **DETAILED ERROR LOG (ENGLISH):**\n```text\n{joined_errors}\n```"
-        else:
-            summary_text += "\n✅ **Status:** `All media processed smoothly with 0 errors!`"
-
-        user_sessions.setdefault(user_id, {})["state"] = "IDLE"
-        await update_panel(client, user_id, summary_text, get_home_keyboard())
-
+    except ScanCancelled:
+        cancelled = True
     except Exception as fatal_e:
+        fatal = True
         err_trace = traceback.format_exc()
-        user_sessions.setdefault(user_id, {})["state"] = "IDLE"
         await update_panel(
             client, user_id,
             f"🚨 **CRITICAL BOT FAILURE (UNHANDLED EXCEPTION)**\n\n"
             f"**Exception Type:** `{type(fatal_e).__name__}`\n"
-            f"**Error Message:** `{str(fatal_e)}`\n\n"
+            f"**Error Message:** `{safe(str(fatal_e))[:300]}`\n\n"
             f"**Full Traceback (Where it failed):**\n```python\n{err_trace[-1200:]}\n```",
-            get_home_keyboard()
+            end_kb
         )
+    finally:
+        for fn in glob.glob(f"tmp_{user_id}_*"):
+            try:
+                os.remove(fn)
+            except Exception:
+                pass
+        if active_scans.get(user_id) is state:
+            active_scans.pop(user_id, None)
+        user_sessions.setdefault(user_id, {})["state"] = "IDLE"
+
+    if fatal:
+        return
+
+    head = "⛔ **SCAN STOPPED**" if cancelled else "🏁 **SCAN COMPLETED**"
+    summary_text = (
+        f"{head}\n\n"
+        f"⚡ **Engine Used:** `{uploader_mode}`\n"
+        f"📌 **Page Title:** `{safe(title)[:45]}`\n"
+        f"🏷️ **Section Tag:** `{hashtag}`\n"
+        f"📁 **Albums Completed:** `{albums_done}/{total_albums}`\n"
+        f"🎬 **Videos Uploaded:** `{up_v}`\n"
+        f"🖼️ **Photos Uploaded:** `{up_p}`\n"
+        f"⏭️ **Skipped (already uploaded):** `{skipped}`\n"
+        f"❌ **Total Failed:** `{len(errors)}`\n"
+    )
+    if cancelled:
+        summary_text += "\n💾 Progress is saved. Tap **Scan Website** again to resume - uploaded files are skipped automatically."
+    if errors:
+        joined_errors = "\n".join(errors[:8])
+        if len(errors) > 8:
+            joined_errors += f"\n...and {len(errors) - 8} more errors."
+        summary_text += f"\n\n⚠️ **DETAILED ERROR LOG (ENGLISH):**\n```text\n{joined_errors}\n```"
+    elif not cancelled:
+        summary_text += "\n✅ **Status:** `All albums processed with 0 errors!`"
+
+    await update_panel(client, user_id, summary_text, end_kb)
 
 # ================= Render Web Service Port Binding =================
 web_app = Flask(__name__)
