@@ -1,0 +1,5 @@
+pyrogram
+tgcrypto
+beautifulsoup4
+aiohttp
+flask
