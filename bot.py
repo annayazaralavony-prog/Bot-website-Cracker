@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import sys
@@ -114,6 +115,7 @@ MAX_ALBUMS_PER_SCAN = 20          # প্রতি স্ক্যানে স
 DEFAULT_HASHTAG = "#newweb"       # ডিফল্ট হ্যাশট্যাগ
 REST_CAPTION_HASHTAG = os.environ.get("REST_CAPTION_HASHTAG", "1") == "1"
 ORDERED_ALBUMS = os.environ.get("ORDERED_ALBUMS", "1") == "1"
+RESOLVE_PARALLEL = max(1, int(os.environ.get("RESOLVE_PARALLEL", "3")))   # একসাথে কয়টা অ্যালবামের পেজ খুলবে
 
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -346,11 +348,19 @@ def mark_as_uploaded(url, hashtag):
     schedule_backup()
 
 def make_album_key(site_key, title, first_url=None):
-    """অ্যালবামকে ইউনিকভাবে চিনতে"""
-    base = f"{site_key}|{(title or '').strip().lower()[:120]}"
+    """অ্যালবামকে ইউনিকভাবে চিনতে (v2: আগের ভুল থাম্বনেইল-স্ক্যানের রেকর্ড এড়াতে)"""
+    base = f"{site_key}|v2|{(title or '').strip().lower()[:120]}"
     if first_url:
         base += f"|{first_url}"
     return base
+
+def album_key_of(site_key, album):
+    url = album.get("url")
+    if url:
+        return f"{site_key}|v2|{url}"
+    items = album.get("items") or []
+    first_url = items[0][1] if items else ""
+    return make_album_key(site_key, album.get("title"), first_url)
 
 def is_album_processed(album_key):
     cursor.execute("SELECT 1 FROM processed_albums WHERE album_key = ?", (album_key,))
@@ -439,11 +449,11 @@ def get_site_albums(site, override_html=None):
                 continue
             seen.add(url)
             items.append((kind, url))
-        if items:
-            clean_albums.append({
-                "title": a.get("title") or f"Album {idx}",
-                "items": items
-            })
+        if items or a.get("needs_resolve"):
+            entry = dict(a)   # url, needs_resolve ইত্যাদি এক্সট্রা ফিল্ড রেখে দিই
+            entry["title"] = a.get("title") or f"Album {idx}"
+            entry["items"] = items
+            clean_albums.append(entry)
     return page_title or site["name"], clean_albums
 
 discover_sites()
@@ -629,14 +639,26 @@ def album_totals(albums):
 def describe_albums(albums, limit=10):
     lines = []
     for i, a in enumerate(albums[:limit], start=1):
-        v = sum(1 for k, _ in a["items"] if k == "video")
-        p = len(a["items"]) - v
-        lines.append(f"{i}. {safe(a['title'])[:32]} - {v}V {p}P")
+        short = safe((a["title"] or "").split("\n")[0])[:32]
+        if a.get("needs_resolve"):
+            lines.append(f"{i}. {short}")
+        else:
+            v = sum(1 for k, _ in a["items"] if k == "video")
+            p = len(a["items"]) - v
+            lines.append(f"{i}. {short} - {v}V {p}P")
     if len(albums) > limit:
         lines.append(f"...and {len(albums) - limit} more albums")
     return "\n".join(lines)
 
 def albums_panel_text(albums):
+    if any(a.get("needs_resolve") for a in albums):
+        text = (
+            f"📁 **Albums/Sections:** `{len(albums)}`\n"
+            f"🔗 ভেতরের ফটো/ভিডিও স্ক্যানের সময় প্রতিটা অ্যালবামের পেজ খুলে আনা হবে।\n"
+        )
+        if albums:
+            text += f"\n```text\n{describe_albums(albums)}\n```\n"
+        return text
     v_total, p_total = album_totals(albums)
     text = (
         f"📁 **Albums/Sections:** `{len(albums)}`\n"
@@ -912,7 +934,10 @@ def url_ext(url, kind="video"):
 async def download_file_with_details(url, dest_path, site_mod, state, progress_cb=None, max_bytes=None):
     # সাইট মডিউলে custom_download থাকলে সেটা ব্যবহার করবে
     if hasattr(site_mod, "custom_download"):
-        return await site_mod.custom_download(url, dest_path, state, progress_cb, max_bytes)
+        ok, err = await site_mod.custom_download(url, dest_path, state, progress_cb, max_bytes)
+        if not ok and err == "__CANCELLED__":
+            raise ScanCancelled()
+        return ok, err
 
     last_err = "Unknown"
     for attempt in range(1, 4):
@@ -1210,17 +1235,18 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         new_albums = []
         for album in albums:
             items = album.get("items") or []
-            if not items:
+            if not items and not album.get("needs_resolve"):
                 continue
 
-            first_url = items[0][1] if items else ""
-            akey = make_album_key(site_key, album.get("title"), first_url)
+            akey = album_key_of(site_key, album)
+            album["_akey"] = akey
 
             if is_album_processed(akey):
                 continue
 
             # সব মিডিয়া আগে থেকেই আপলোড আছে কিনা
-            if all(is_duplicate(url) for _, url in items):
+            # (needs_resolve অ্যালবামে এখন শুধু থাম্বনেইল আছে, তাই আসল মিডিয়া আনার পরে চেক হবে)
+            if not album.get("needs_resolve") and all(is_duplicate(url) for _, url in items):
                 mark_album_processed(akey, site_key, album.get("title"))
                 continue
 
@@ -1241,6 +1267,82 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                 end_kb
             )
             return
+
+        # ========== অ্যালবামের ভেতরের আসল ফটো/ভিডিও বের করা ==========
+        resolve_fn = getattr(site_mod, "resolve_album", None)
+        if resolve_fn:
+            to_resolve = [a for a in albums if a.get("needs_resolve")]
+            if to_resolve:
+                r_sem = asyncio.Semaphore(RESOLVE_PARALLEL)
+                r_done = [0]
+                r_last = [0.0]
+                debug_pages = []
+
+                async def resolve_one(alb):
+                    async with r_sem:
+                        check_cancel(state)
+                        try:
+                            res_items = await resolve_fn(alb, state)
+                            res_items = list(res_items or [])
+                            if not res_items:
+                                raise RuntimeError("কোনো ফটো/ভিডিও পাওয়া যায়নি")
+                            alb["items"] = res_items
+                        except ScanCancelled:
+                            raise
+                        except Exception as re_err:
+                            alb["_skip"] = True
+                            short_title = (alb.get("title") or "").split("\n")[0][:40]
+                            errors.append(
+                                f"• [Album Open Failed] {short_title}\n"
+                                f"  URL: {str(alb.get('url'))[:45]}...\n  Reason: {re_err}"
+                            )
+                            if alb.get("debug_html") and not debug_pages:
+                                debug_pages.append(alb)
+                        r_done[0] += 1
+                        now = time.monotonic()
+                        if now - r_last[0] >= 2 or r_done[0] == len(to_resolve):
+                            r_last[0] = now
+                            try:
+                                await update_panel(
+                                    client, user_id,
+                                    f"🔎 **অ্যালবামের ভেতরের ফটো/ভিডিও খোঁজা হচ্ছে...**\n"
+                                    f"📁 `{r_done[0]}/{len(to_resolve)}` | ❌ Failed: `{len(errors)}`",
+                                    cancel_kb
+                                )
+                            except Exception:
+                                pass
+
+                await update_panel(
+                    client, user_id,
+                    f"🔎 **অ্যালবামের ভেতরের ফটো/ভিডিও খোঁজা হচ্ছে...**\n📁 `0/{len(to_resolve)}`",
+                    cancel_kb
+                )
+                await asyncio.gather(*[resolve_one(a) for a in to_resolve])
+
+                albums = [a for a in albums if not a.get("_skip")]
+                total_albums = len(albums)
+
+                if debug_pages:
+                    try:
+                        dbg = debug_pages[0]
+                        bio = io.BytesIO(dbg["debug_html"].encode("utf-8", "ignore"))
+                        bio.name = "album_page_debug.html"
+                        await client.send_document(
+                            user_id, bio,
+                            caption=f"🐞 Debug: এই পেজ থেকে ফটো/ভিডিও পাওয়া যায়নি\n{str(dbg.get('url'))[:200]}"
+                        )
+                    except Exception as dbg_err:
+                        print(f"⚠️ Debug HTML send failed: {dbg_err}")
+
+                if not albums:
+                    joined = "\n".join(errors[:6])
+                    await update_panel(
+                        client, user_id,
+                        f"❌ **কোনো অ্যালবামের ভেতরের কনটেন্ট পাওয়া যায়নি**\n\n```text\n{joined}\n```\n"
+                        f"উপরে পাঠানো `album_page_debug.html` ফাইলটা আমাকে দিন।",
+                        end_kb
+                    )
+                    return
 
         uploaders = await build_uploaders()
         if uploaders[0]["name"] == "Bot Token":
@@ -1276,8 +1378,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
 
             if not items:
                 # পুরো অ্যালবাম আগেই আপলোড → মার্ক করে দিই
-                first_url = all_items[0][1] if all_items else ""
-                akey = make_album_key(site_key, album.get("title"), first_url)
+                akey = album.get("_akey") or album_key_of(site_key, album)
                 mark_album_processed(akey, site_key, album.get("title"))
                 continue
 
@@ -1409,8 +1510,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             # শুধু সম্পূর্ণ সফল হলে অ্যালবাম "প্রসেসড" মার্ক হবে
             # (ফেইল হলে পরের স্ক্যানে আবার চেষ্টা হবে, আপলোড হওয়া ফাইল ডুপ্লিকেট হিসেবে স্কিপ হবে)
             if a_fail == 0:
-                first_url = all_items[0][1] if all_items else ""
-                akey = make_album_key(site_key, album.get("title"), first_url)
+                akey = album.get("_akey") or album_key_of(site_key, album)
                 mark_album_processed(akey, site_key, album.get("title"))
 
             albums_done += 1
