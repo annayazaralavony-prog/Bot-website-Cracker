@@ -150,6 +150,8 @@ if TELETHON_AVAILABLE:
 dead_telethon = {}      # id(client) -> কারণ (AuthKeyDuplicated ইত্যাদি হলে এখানে যাবে)
 connect_locks = {}      # id(client) -> asyncio.Lock (একসাথে দুইবার connect ঠেকাতে)
 primed_clients = set()  # যেসব ক্লায়েন্টের চ্যানেল entity লোড হয়েছে
+backup_primed_pyro = set()      # যেসব Pyrogram ইউজার ক্লায়েন্ট ব্যাকআপ চ্যানেল চিনেছে
+backup_primed_telethon = set()  # যেসব Telethon ক্লায়েন্ট ব্যাকআপ চ্যানেল চিনেছে
 
 def mark_telethon_dead(c, reason):
     if id(c) not in dead_telethon:
@@ -244,10 +246,55 @@ def _make_snapshot():
     dst.close()
     return snap
 
+async def _prime_pyro_backup_channel(pc):
+    """Pyrogram ইউজার সেশনকে ব্যাকআপ চ্যানেল চিনিয়ে নেয় (in_memory সেশনে cache থাকে না)"""
+    if id(pc) in backup_primed_pyro:
+        return True
+    try:
+        await pc.get_chat(BACKUP_CHANNEL_ID)
+        backup_primed_pyro.add(id(pc))
+        return True
+    except Exception:
+        pass
+    try:
+        async for _d in pc.get_dialogs():
+            pass
+        await pc.get_chat(BACKUP_CHANNEL_ID)
+        backup_primed_pyro.add(id(pc))
+        return True
+    except Exception as e:
+        print(f"⚠️ Pyrogram user ব্যাকআপ চ্যানেল চিনতে পারেনি: {type(e).__name__}: {e}")
+        return False
+
+async def _prime_telethon_backup_channel(tc):
+    """Telethon সেশনকে ব্যাকআপ চ্যানেল চিনিয়ে নেয়"""
+    if id(tc) in backup_primed_telethon:
+        return True
+    try:
+        await tc.get_entity(BACKUP_CHANNEL_ID)
+        backup_primed_telethon.add(id(tc))
+        return True
+    except AuthKeyDuplicatedError:
+        raise
+    except Exception:
+        pass
+    try:
+        async for _d in tc.iter_dialogs():
+            pass
+        await tc.get_entity(BACKUP_CHANNEL_ID)
+        backup_primed_telethon.add(id(tc))
+        return True
+    except AuthKeyDuplicatedError:
+        raise
+    except Exception as e:
+        print(f"⚠️ Telethon ব্যাকআপ চ্যানেল চিনতে পারেনি: {type(e).__name__}: {e}")
+        return False
+
 async def do_backup():
     global backup_dirty, last_backup_msg_id
     snap = None
     backup_dirty = False
+    used_telethon = False
     try:
         snap = _make_snapshot()
         size_mb = os.path.getsize(snap) / (1024 * 1024)
@@ -260,25 +307,100 @@ async def do_backup():
         cursor.execute("SELECT COUNT(*) FROM site_html")
         (html_n,) = cursor.fetchone()
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        cap = f"{BACKUP_TAG}\n🕒 {stamp}\n🎬 Media records: {media_n}\n📄 Saved HTML: {html_n}"
 
-        msg = await bot.send_document(
-            BACKUP_CHANNEL_ID,
-            snap,
-            file_name="scraped_data_backup.db",
-            caption=f"{BACKUP_TAG}\n🕒 {stamp}\n🎬 Media records: {media_n}\n📄 Saved HTML: {html_n}"
-        )
+        new_id = None
+        sender_kind = None
+        sender_obj = None
+        errs = []
+
+        # ১) আগে বট টোকেন দিয়ে চেষ্টা
         try:
-            await bot.pin_chat_message(BACKUP_CHANNEL_ID, msg.id, disable_notification=True)
+            msg = await bot.send_document(
+                BACKUP_CHANNEL_ID,
+                snap,
+                file_name="scraped_data_backup.db",
+                caption=cap
+            )
+            new_id = msg.id
+            sender_kind = "bot"
+            sender_obj = bot
+        except Exception as bot_err:
+            errs.append(f"Bot: {type(bot_err).__name__}: {bot_err}")
+            print(f"⚠️ Bot backup failed ({bot_err}) - ইউজার আইডি দিয়ে চেষ্টা করা হচ্ছে...")
+
+        # ২) বট ব্যর্থ হলে Pyrogram ইউজার আইডি দিয়ে
+        if new_id is None:
+            for _n, pc in pyro_ready:
+                try:
+                    if not await _prime_pyro_backup_channel(pc):
+                        errs.append(f"{_n}: চ্যানেল চেনা যায়নি")
+                        continue
+                    msg = await pc.send_document(
+                        BACKUP_CHANNEL_ID,
+                        snap,
+                        file_name="scraped_data_backup.db",
+                        caption=cap
+                    )
+                    new_id = msg.id
+                    sender_kind = "pyro"
+                    sender_obj = pc
+                    break
+                except Exception as e:
+                    errs.append(f"{_n}: {type(e).__name__}: {e}")
+                    print(f"⚠️ Pyrogram user backup failed: {e}")
+
+        # ৩) তাতেও না হলে Telethon দিয়ে
+        if new_id is None and TELETHON_AVAILABLE:
+            try:
+                t_ok, t_info = await ensure_telethon_connected()
+                tc = get_telethon()
+                if t_ok and tc is not None:
+                    used_telethon = True
+                    if await _prime_telethon_backup_channel(tc):
+                        msg = await tc.send_file(
+                            BACKUP_CHANNEL_ID, snap, caption=cap, force_document=True
+                        )
+                        new_id = msg.id
+                        sender_kind = "telethon"
+                        sender_obj = tc
+                    else:
+                        errs.append("Telethon: চ্যানেল চেনা যায়নি")
+                else:
+                    errs.append(f"Telethon: {t_info}")
+            except AuthKeyDuplicatedError:
+                if tc is not None:
+                    mark_telethon_dead(tc, "AuthKeyDuplicatedError during backup")
+                errs.append("Telethon: AuthKeyDuplicatedError")
+            except Exception as e:
+                errs.append(f"Telethon: {type(e).__name__}: {e}")
+                print(f"⚠️ Telethon backup failed: {e}")
+
+        if new_id is None:
+            raise RuntimeError("কোনো আইডি দিয়েই ব্যাকআপ পাঠানো যায়নি | " + " | ".join(errs)[:350])
+
+        # পিন করা
+        try:
+            if sender_kind == "bot":
+                await bot.pin_chat_message(BACKUP_CHANNEL_ID, new_id, disable_notification=True)
+            elif sender_kind == "pyro":
+                await sender_obj.pin_chat_message(BACKUP_CHANNEL_ID, new_id, disable_notification=True)
+            elif sender_kind == "telethon":
+                await sender_obj.pin_message(BACKUP_CHANNEL_ID, new_id, notify=False)
         except Exception as pin_err:
             print(f"⚠️ Backup pin failed: {pin_err}")
 
+        # আগের ব্যাকআপ মেসেজ মুছে ফেলা
         old_id = last_backup_msg_id
-        last_backup_msg_id = msg.id
-        if old_id and old_id != msg.id:
+        last_backup_msg_id = new_id
+        if old_id and old_id != new_id:
             try:
-                await bot.delete_messages(BACKUP_CHANNEL_ID, old_id)
+                await sender_obj.delete_messages(BACKUP_CHANNEL_ID, old_id)
             except Exception:
-                pass
+                try:
+                    await bot.delete_messages(BACKUP_CHANNEL_ID, old_id)
+                except Exception:
+                    pass
         return True, stamp
     except Exception as e:
         backup_dirty = True
@@ -286,6 +408,11 @@ async def do_backup():
     finally:
         if snap and os.path.exists(snap):
             os.remove(snap)
+        if used_telethon:
+            try:
+                await release_telethon()
+            except Exception:
+                pass
 
 async def backup_worker():
     while True:
@@ -331,7 +458,8 @@ async def restore_db_from_telegram():
         tc = get_telethon()
         if t_ok and tc is not None:
             try:
-                async for m in tc.iter_messages(BACKUP_CHANNEL_ID, search=BACKUP_TAG, limit=20):
+                await _prime_telethon_backup_channel(tc)
+                async for m in tc.iter_messages(BACKUP_CHANNEL_ID, search=BACKUP_TAG, limit=50):
                     if m.document:
                         path = await tc.download_media(m, "restore_tmp.db")
                         msg_id = m.id
@@ -805,7 +933,7 @@ async def backup_cmd(client, message):
     await reset_panel(client, user_id)
     await update_panel(client, user_id, "💾 **Creating database backup in Telegram...**")
     ok, info = await do_backup()
-    text = f"✅ **BACKUP COMPLETED**\n• **Time:** `{info}`" if ok else f"❌ **BACKUP FAILED**\n• **Reason:** `{info}`"
+    text = f"✅ **BACKUP COMPLETED**\n• **Time:** `{info}`" if ok else f"❌ **BACKUP FAILED**\n• **Reason:** `{safe(info)[:600]}`"
     await update_panel(client, user_id, text, get_home_keyboard())
 
 @bot.on_callback_query()
