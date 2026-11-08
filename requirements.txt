@@ -1,8 +1,9 @@
-Pyrogram==2.0.106
+pyrogram==2.0.106
 tgcrypto
-Telethon
-hachoir
+telethon
 aiohttp
-beautifulsoup4
 flask
 curl_cffi
+beautifulsoup4
+lxml
+hachoir
