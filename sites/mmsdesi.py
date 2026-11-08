@@ -25,6 +25,10 @@ MAX_ITEMS_PER_ALBUM = max(1, int(os.environ.get("MAX_ITEMS_PER_ALBUM", "300"))) 
 FETCH_RETRIES = 3
 DOWNLOAD_RETRIES = 3
 
+# অ্যালবামের পেজের পুরো HTML (স্ক্রিপ্ট/JSON সহ) থেকেও সব ভিডিও খোঁজা হবে (ডিফল্ট চালু)।
+# শুধু মূল কনটেন্ট এলাকা থেকে ভিডিও চাইলে Railway Variables-এ VIDEO_WIDE_SCAN=0 দিন।
+VIDEO_WIDE_SCAN = os.environ.get("VIDEO_WIDE_SCAN", "1") != "0"
+
 # কুকি Railway Variables-এ SITE_COOKIE নামে দিলে সেটাই ব্যবহার হবে (কুকি মেয়াদ শেষ হলে সহজে বদলানো যাবে)
 DEFAULT_COOKIE = (
     "_ga=GA1.1.2033937358.1793779443; "
@@ -90,6 +94,11 @@ SCOPE_SELECTORS = [
 ]
 META_VIDEO_KEYS = ("og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream")
 EMBED_HINT_RE = re.compile(r"embed|player|video|stream|play|watch", re.IGNORECASE)
+# একটা অ্যালবাম একাধিক পেজে ভাগ করা থাকলে সেই পেজ-লিংক চেনার জন্য
+PAGINATION_CLASS_RE = re.compile(
+    r"pagination|page-links|pager|post-page|wp-pagenavi|page-numbers|nav-links",
+    re.IGNORECASE
+)
 
 
 # ================= URL হেল্পার =================
@@ -118,6 +127,19 @@ def _same_site(url):
 
 def _is_video_url(url):
     return urlparse(url).path.lower().endswith(VIDEO_EXTS)
+
+
+def _video_urls_in_text(text, base=None):
+    """যেকোনো টেক্সট (অ্যাট্রিবিউট/স্ক্রিপ্ট/JSON) থেকে সবগুলো ভিডিও লিংক বের করে (\\/ এস্কেপসহ)"""
+    out = []
+    if not text or not isinstance(text, str):
+        return out
+    t = text.replace("\\/", "/").replace("\\u0026", "&").replace("\\u003d", "=")
+    for m in VIDEO_EXT_RE.findall(t):
+        u = _normalize_url(m, base)
+        if u and u not in out:
+            out.append(u)
+    return out
 
 
 def _extract_from_srcset(srcset_val, base=None):
@@ -160,11 +182,9 @@ def classify_node(tag, base=None):
     # ১) যেকোনো অ্যাট্রিবিউটে ভিডিও লিংক
     for attr, val in tag.attrs.items():
         if isinstance(val, str):
-            m = VIDEO_EXT_RE.search(val)
-            if m:
-                u = _normalize_url(m.group(0), base)
-                if u:
-                    return ("video", u)
+            found = _video_urls_in_text(val, base)
+            if found:
+                return ("video", found[0])
 
     # ২) <video src> / <source type=video/*> (এক্সটেনশন ছাড়া হলেও)
     if tag.name in ("video", "source"):
@@ -216,16 +236,23 @@ def classify_node(tag, base=None):
 def iter_scope_media(scope, base=None):
     for node in scope.descendants:
         if isinstance(node, Tag):
+            yielded = set()
+            # একই ট্যাগের একাধিক অ্যাট্রিবিউটে/JSON-এ থাকা সবগুলো ভিডিও
+            for _attr, val in node.attrs.items():
+                if isinstance(val, str):
+                    for u in _video_urls_in_text(val, base):
+                        if u not in yielded:
+                            yielded.add(u)
+                            yield ("video", u)
             res = classify_node(node, base)
             if res and res[1]:
+                if res[0] == "video" and res[1] in yielded:
+                    continue
                 yield res
         elif isinstance(node, NavigableString):
             if node.parent and node.parent.name in ("script", "noscript"):
-                text = str(node).replace("\\/", "/")
-                for m in VIDEO_EXT_RE.findall(text):
-                    u = _normalize_url(m, base)
-                    if u:
-                        yield ("video", u)
+                for u in _video_urls_in_text(str(node), base):
+                    yield ("video", u)
 
 
 # ================= টাইটেল বের করা =================
@@ -582,6 +609,11 @@ def _pick_scope(soup, base):
     return soup.body or soup
 
 
+def _is_junk_tag(t):
+    cid = " ".join(t.get("class") or []) + " " + (t.get("id") or "")
+    return t.name in ("nav", "aside", "footer", "form") or bool(JUNK_CLASS_RE.search(cid))
+
+
 def _prune_junk(scope):
     ancestors = {id(p) for p in scope.parents}
     for t in list(scope.find_all(True)):
@@ -590,11 +622,26 @@ def _prune_junk(scope):
                 continue
             if t is scope or id(t) in ancestors:
                 continue
-            cid = " ".join(t.get("class") or []) + " " + (t.get("id") or "")
-            if t.name in ("nav", "aside", "footer", "form") or JUNK_CLASS_RE.search(cid):
+            if _is_junk_tag(t):
                 t.decompose()
         except AttributeError:
             continue
+
+
+def _collect_junk_videos(soup, base, scope):
+    """রিলেটেড/সাইডবার/ফুটার ইত্যাদি অংশে থাকা ভিডিও লিংকের সেট (এগুলো অ্যালবামের অংশ নয়)"""
+    junk = set()
+    ancestors = {id(p) for p in scope.parents}
+    for t in soup.find_all(True):
+        try:
+            if t is scope or id(t) in ancestors or t.name in ("html", "body", "head"):
+                continue
+            if _is_junk_tag(t):
+                for u in _video_urls_in_text(str(t), base):
+                    junk.add(u)
+        except Exception:
+            continue
+    return junk
 
 
 def _collect_iframes(scope, base):
@@ -626,16 +673,38 @@ def _meta_videos(soup, base):
 
 
 def _wide_videos(html_text, base):
-    text = html_text.replace("\\/", "/").replace("\\u0026", "&")
-    found = []
-    for m in VIDEO_EXT_RE.findall(text):
-        u = _normalize_url(m, base)
-        if u and u not in found:
-            found.append(u)
-    return found
+    return _video_urls_in_text(html_text, base)
 
 
-def extract_detail(html_text, page_url):
+def _more_pages(soup, page_url, root_url):
+    """একই অ্যালবামের অন্য পেজের (1,2,3...) লিংক"""
+    out = []
+    root = root_url or page_url
+    base_path = (urlparse(root).path or "").rstrip("/")
+    if not base_path:
+        return out
+    try:
+        for box in soup.find_all(class_=PAGINATION_CLASS_RE):
+            for a in box.find_all("a", href=True):
+                u = _normalize_url(a.get("href"), page_url)
+                if not u or not _same_site(u):
+                    continue
+                u = u.split("#")[0]
+                if u == page_url or u in out:
+                    continue
+                path = (urlparse(u).path or "").rstrip("/")
+                if "comment-page" in path.lower():
+                    continue
+                if path.lower().endswith(IMG_EXTS + VIDEO_EXTS):
+                    continue
+                if path == base_path or path.startswith(base_path + "/"):
+                    out.append(u)
+    except Exception:
+        pass
+    return out
+
+
+def extract_detail(html_text, page_url, root_url=None):
     """
     একটা অ্যালবাম পেজের HTML থেকে (items, next_page_urls, iframe_urls, notes) ফেরত দেয়।
     """
@@ -651,22 +720,40 @@ def extract_detail(html_text, page_url):
                 nxt.append(u)
     except Exception:
         pass
+    for u in _more_pages(soup, page_url, root_url):
+        if u not in nxt:
+            nxt.append(u)
 
     scope = _pick_scope(soup, page_url)
     notes["scope"] = getattr(scope, "name", "") or "page"
     iframes = _collect_iframes(scope, page_url)
+
+    junk_videos = _collect_junk_videos(soup, page_url, scope) if VIDEO_WIDE_SCAN else set()
     _prune_junk(scope)
 
     items = list(dict.fromkeys(iter_scope_media(scope, page_url)))
+    have = {u for _k, u in items}
 
-    if not any(k == "video" for k, _u in items):
-        for u in _meta_videos(soup, page_url):
+    # মেটা ট্যাগের ভিডিও (সবসময় যোগ হবে)
+    for u in _meta_videos(soup, page_url):
+        if u not in have:
             items.append(("video", u))
+            have.add(u)
 
-    # ভিডিও না পেলে এবং প্রায় কিছুই না পেলে পুরো পেজে (স্ক্রিপ্টসহ) খুঁজি
-    if not any(k == "video" for k, _u in items) and len(items) <= 1:
+    if VIDEO_WIDE_SCAN:
+        # পুরো পেজের HTML/স্ক্রিপ্ট/JSON থেকে বাকি সব ভিডিও (রিলেটেড/সাইডবারের ভিডিও বাদে)
         for u in _wide_videos(html_text, page_url):
+            if u in have or u in junk_videos:
+                continue
             items.append(("video", u))
+            have.add(u)
+    else:
+        # পুরনো আচরণ: ভিডিও না পেলে এবং প্রায় কিছুই না পেলে পুরো পেজে খুঁজি
+        if not any(k == "video" for k, _u in items) and len(items) <= 1:
+            for u in _wide_videos(html_text, page_url):
+                if u not in have:
+                    items.append(("video", u))
+                    have.add(u)
 
     items = list(dict.fromkeys(items))
     return items, nxt, iframes, notes
@@ -787,7 +874,7 @@ async def resolve_album(album, state=None):
             notes["pages"] += 1
             notes["bytes"] += len(page_html)
 
-            items, nxt, iframes, pn = extract_detail(page_html, page_url)
+            items, nxt, iframes, pn = extract_detail(page_html, page_url, url)
             notes["hls"] = notes["hls"] or pn["hls"]
             notes["scope"] = notes["scope"] or pn["scope"]
             collected.extend(items)
