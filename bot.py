@@ -52,10 +52,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
 STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", "-100123456789"))
 TELETHON_SESSION_STRING = os.environ.get("TELETHON_SESSION_STRING", "").strip()
 
-
-# ---- একাধিক অ্যাকাউন্ট (Album-level Concurrency) ----
-# অতিরিক্ত অ্যাকাউন্ট দিতে: TELETHON_SESSION_STRING_2, TELETHON_SESSION_STRING_3 ... (৯ পর্যন্ত)
-# অথবা কমা দিয়ে আলাদা করে: TELETHON_SESSION_STRINGS="sess1,sess2,sess3"
+# ---- একাধিক অ্যাকাউন্ট ----
 def _collect_session_strings():
     found = []
     if TELETHON_SESSION_STRING:
@@ -74,10 +71,6 @@ def _collect_session_strings():
             unique.append(s)
     return unique
 
-
-# ---- Pyrogram User Session Strings (আপলোডার অ্যাকাউন্ট) ----
-# PYROGRAM_SESSION_STRING (অ্যাকাউন্ট ১), PYROGRAM_SESSION_STRING_2 ... _9
-# অথবা কমা দিয়ে: PYROGRAM_SESSION_STRINGS="sess1,sess2,sess3"
 def _collect_pyro_sessions():
     found = []
     first = os.environ.get("PYROGRAM_SESSION_STRING", "").strip()
@@ -97,11 +90,8 @@ def _collect_pyro_sessions():
             unique.append(x)
     return unique
 
-
-# একটি অ্যালবামের ভেতরে একসাথে কয়টি ফাইল প্যারালাল ডাউনলোড হবে
 DOWNLOAD_PARALLEL = max(1, int(os.environ.get("DOWNLOAD_PARALLEL", "5")))
-
-SITES_DIR = "sites"  # গিটহাবে এই ফোল্ডারে সাইটের ফাইলগুলো রাখবেন (অথবা রুট ফোল্ডারে)
+SITES_DIR = "sites"
 DB_PATH = "scraped_data.db"
 BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID") or -1004448646419)
 BACKUP_TAG = "#DB_BACKUP"
@@ -109,29 +99,24 @@ SITE_PREFIX = "🌐 "
 
 MAX_ALBUM_BATCH = 10
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "2000")) * 1024 * 1024
-# [CHANGED] ডিফল্ট 2000 MB (আগে 20000)। রেন্ডারের ডিস্ক ছোট, তাই প্রতি আপলোড-পার্টে সর্বোচ্চ এত MB ডিস্কে থাকবে।
-# মনে রাখবেন: মোট ডিস্ক ব্যবহার = অ্যাকাউন্ট সংখ্যা × এই লিমিট। ডিস্ক আরও কম হলে MAX_BATCH_MB কমান।
 MAX_BATCH_BYTES = int(os.environ.get("MAX_BATCH_MB", "2000")) * 1024 * 1024
 
-# [NEW] 1 = অ্যালবামের বাকি ফাইলে শুধু হ্যাশট্যাগ ক্যাপশন, 0 = বাকি ফাইলে কোনো ক্যাপশন নেই
+# ========== নতুন সেটিংস ==========
+MAX_ALBUMS_PER_SCAN = 20          # প্রতি স্ক্যানে সর্বোচ্চ কয়টা অ্যালবাম
+DEFAULT_HASHTAG = "#newweb"       # ডিফল্ট হ্যাশট্যাগ
 REST_CAPTION_HASHTAG = os.environ.get("REST_CAPTION_HASHTAG", "1") == "1"
-
-# [NEW] 1 = চ্যানেলে অ্যালবামগুলো ১, ২, ৩... ক্রমে পোস্ট হবে (ডাউনলোড সবাই একসাথে করবে, আপলোড ক্রমে)
-#       0 = যে অ্যালবাম আগে শেষ হয় সে আগে পোস্ট হবে (বেশি স্পিড)
 ORDERED_ALBUMS = os.environ.get("ORDERED_ALBUMS", "1") == "1"
 
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Pyrogram User Session ক্লায়েন্টগুলো (আপলোডার অ্যাকাউন্ট)
 pyro_clients = []
 for _i, _sess in enumerate(_collect_pyro_sessions(), start=1):
     pyro_clients.append(Client(
         f"uploader_acc_{_i}", api_id=API_ID, api_hash=API_HASH,
         session_string=_sess, in_memory=True
     ))
-pyro_ready = []  # সফলভাবে স্টার্ট হওয়া ক্লায়েন্ট: [(নাম, client)]
+pyro_ready = []
 
-# প্রথম ক্লায়েন্ট (telethon_client) আগের মতোই ব্যাকআপ রিস্টোর/চ্যানেল সিঙ্কে ব্যবহার হয়
 telethon_clients = []
 if TELETHON_AVAILABLE:
     for _sess in _collect_session_strings():
@@ -141,7 +126,6 @@ telethon_client = telethon_clients[0] if telethon_clients else None
 # ================= ডাটাবেস =================
 conn = None
 cursor = None
-
 
 def init_db():
     global conn, cursor
@@ -164,8 +148,16 @@ def init_db():
             html TEXT
         )
     """)
+    # নতুন টেবিল: কোন অ্যালবাম প্রসেস হয়েছে ট্র্যাক করার জন্য
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS processed_albums (
+            album_key TEXT PRIMARY KEY,
+            site_key TEXT,
+            title TEXT,
+            processed_at TEXT
+        )
+    """)
     conn.commit()
-
 
 def db_is_empty():
     cursor.execute("SELECT COUNT(*) FROM uploaded_media")
@@ -174,15 +166,12 @@ def db_is_empty():
     (html_n,) = cursor.fetchone()
     return media_n == 0 and html_n == 0
 
-
-# ---- "Send New HTML" দিয়ে পাঠানো HTML স্থায়ীভাবে ডাটাবেসে সেভ (ডিপ্লয়ের পরও থাকবে) ----
 def save_site_html(site_key, html_content):
     if not html_content or not html_content.strip():
         return
     cursor.execute("INSERT OR REPLACE INTO site_html (site_key, html) VALUES (?, ?)", (site_key, html_content))
     conn.commit()
     schedule_backup()
-
 
 def db_get_site_html(site_key):
     try:
@@ -192,7 +181,6 @@ def db_get_site_html(site_key):
     except Exception:
         return None
 
-
 init_db()
 
 # ================= টেলিগ্রাম ব্যাকআপ সিস্টেম =================
@@ -200,13 +188,11 @@ backup_event = None
 backup_dirty = False
 last_backup_msg_id = None
 
-
 def schedule_backup():
     global backup_dirty
     backup_dirty = True
     if backup_event is not None:
         backup_event.set()
-
 
 def _make_snapshot():
     snap = "scraped_data_snapshot.db"
@@ -216,7 +202,6 @@ def _make_snapshot():
     conn.backup(dst)
     dst.close()
     return snap
-
 
 async def do_backup():
     global backup_dirty, last_backup_msg_id
@@ -261,7 +246,6 @@ async def do_backup():
         if snap and os.path.exists(snap):
             os.remove(snap)
 
-
 async def backup_worker():
     while True:
         await backup_event.wait()
@@ -275,7 +259,6 @@ async def backup_worker():
                 backup_event.set()
         await asyncio.sleep(20)
 
-
 def _valid_backup_file(path):
     try:
         c = sqlite3.connect(path)
@@ -284,7 +267,6 @@ def _valid_backup_file(path):
         return "uploaded_media" in names
     except Exception:
         return False
-
 
 async def restore_db_from_telegram():
     global last_backup_msg_id
@@ -329,30 +311,43 @@ async def restore_db_from_telegram():
     (media_n,) = cursor.fetchone()
     return f"Restored from Telegram backup: {media_n} media records."
 
-
 def is_duplicate(url):
     cursor.execute("SELECT 1 FROM uploaded_media WHERE media_url = ?", (url,))
     return cursor.fetchone() is not None
-
 
 def mark_as_uploaded(url, hashtag):
     cursor.execute("INSERT OR IGNORE INTO uploaded_media (media_url, hashtag) VALUES (?, ?)", (url, hashtag))
     conn.commit()
     schedule_backup()
 
+def make_album_key(site_key, title, first_url=None):
+    """অ্যালবামকে ইউনিকভাবে চিনতে"""
+    base = f"{site_key}|{(title or '').strip().lower()[:120]}"
+    if first_url:
+        base += f"|{first_url}"
+    return base
+
+def is_album_processed(album_key):
+    cursor.execute("SELECT 1 FROM processed_albums WHERE album_key = ?", (album_key,))
+    return cursor.fetchone() is not None
+
+def mark_album_processed(album_key, site_key, title):
+    cursor.execute(
+        "INSERT OR IGNORE INTO processed_albums (album_key, site_key, title, processed_at) VALUES (?, ?, ?, ?)",
+        (album_key, site_key, title or "", datetime.now(timezone.utc).isoformat())
+    )
+    conn.commit()
+    schedule_backup()
 
 # ================= ডাইনামিক সাইট ফাইল লোডার =================
-loaded_sites = {}  # key -> {"key", "name", "hashtag", "module", "path"}
-
+loaded_sites = {}
 
 def discover_sites():
-    """গিটহাব রিপোজিটরির sites/ ফোল্ডার বা রুট ফোল্ডার থেকে সব ওয়েবসাইট স্ক্রিপ্ট লোড করে"""
     global loaded_sites
     loaded_sites = {}
     os.makedirs(SITES_DIR, exist_ok=True)
 
     candidates = sorted(glob.glob(os.path.join(SITES_DIR, "*.py")))
-    # রুট ফোল্ডারেও যদি কোনো সাইট ফাইল থাকে (bot.py/app.py বাদে) সেটাও চেক করবে
     for f in sorted(glob.glob("*.py")):
         if os.path.basename(f).lower() not in ("bot.py", "app.py", "main.py"):
             candidates.append(f)
@@ -367,12 +362,11 @@ def discover_sites():
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
 
-            # ফাইলটিতে extract_albums বা get_albums বা HTML_CONTENT থাকতে হবে
             if not (hasattr(mod, "extract_albums") or hasattr(mod, "get_albums") or hasattr(mod, "HTML_CONTENT")):
                 continue
 
             name = str(getattr(mod, "SITE_NAME", key)).strip()[:30]
-            hashtag = str(getattr(mod, "HASHTAG", "#rells")).strip()
+            hashtag = str(getattr(mod, "HASHTAG", DEFAULT_HASHTAG)).strip()
             if not hashtag.startswith("#"):
                 hashtag = f"#{hashtag}"
 
@@ -388,7 +382,6 @@ def discover_sites():
 
     return loaded_sites
 
-
 def find_site_by_label(label):
     name = label[len(SITE_PREFIX):].strip() if label.startswith(SITE_PREFIX) else label.strip()
     for site in loaded_sites.values():
@@ -396,9 +389,7 @@ def find_site_by_label(label):
             return site
     return None
 
-
 def get_site_albums(site, override_html=None):
-    """নির্দিষ্ট ওয়েবসাইটের ফাইল থেকে অ্যালবাম ও ভিডিও লিস্ট বের করে আনে"""
     mod = site["module"]
     html_content = override_html if override_html is not None else getattr(mod, "HTML_CONTENT", "")
 
@@ -414,7 +405,6 @@ def get_site_albums(site, override_html=None):
     else:
         page_title, albums = site["name"], res
 
-    # ডুপ্লিকেট লিংক পরিষ্কার করা
     clean_albums = []
     for idx, a in enumerate(albums or [], start=1):
         seen = set()
@@ -431,19 +421,34 @@ def get_site_albums(site, override_html=None):
             })
     return page_title or site["name"], clean_albums
 
-
 discover_sites()
 
 # ================= ইউজার সেশন ও বাটন =================
 user_sessions = {}
+active_scans = {}
 
+class ScanCancelled(Exception):
+    pass
+
+def check_cancel(state):
+    if state and state.get("cancel"):
+        raise ScanCancelled()
+
+async def cancellable_sleep(seconds, state):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        check_cancel(state)
+        await asyncio.sleep(min(0.5, end - time.monotonic()))
+
+async def run_cancellable(coro, state):
+    check_cancel(state)
+    return await coro
 
 def get_home_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Reload Site Files", callback_data="action_reload_sites")],
         [InlineKeyboardButton("🔄 Sync Storage Channel (Telethon)", callback_data="action_sync_channel")]
     ])
-
 
 def get_site_keyboard(site_key):
     return InlineKeyboardMarkup([
@@ -452,13 +457,16 @@ def get_site_keyboard(site_key):
         [InlineKeyboardButton("🏠 Home", callback_data="menu_home")]
     ])
 
+def get_cancel_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⛔ Cancel Scan", callback_data="action_cancel_scan")]
+    ])
 
 def build_sites_reply_keyboard():
     if not loaded_sites:
         return None
     rows = [[KeyboardButton(f"{SITE_PREFIX}{s['name']}")] for s in loaded_sites.values()]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, placeholder="Select a website module...")
-
 
 async def refresh_menu(client, user_id):
     session = user_sessions.setdefault(user_id, {})
@@ -477,7 +485,6 @@ async def refresh_menu(client, user_id):
                 pass
     except Exception:
         pass
-
 
 async def update_panel(client, user_id, text, reply_markup=None):
     session = user_sessions.get(user_id, {})
@@ -502,7 +509,6 @@ async def update_panel(client, user_id, text, reply_markup=None):
             )
             user_sessions.setdefault(user_id, {})["panel_msg_id"] = msg.id
 
-
 async def reset_panel(client, user_id):
     session = user_sessions.setdefault(user_id, {})
     old_id = session.get("panel_msg_id")
@@ -513,9 +519,7 @@ async def reset_panel(client, user_id):
             pass
     session["panel_msg_id"] = None
 
-
 async def ensure_telethon_connected(tclient=None):
-    """tclient না দিলে প্রথম Telethon ক্লায়েন্ট চেক করবে (আগের মতোই)"""
     if not TELETHON_AVAILABLE:
         return False, "Telethon not installed."
     target = tclient if tclient is not None else telethon_client
@@ -530,17 +534,13 @@ async def ensure_telethon_connected(tclient=None):
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)}"
 
-
-# ================= সাইট প্যানেল ডিসপ্লে =================
 def safe(text):
     return str(text).replace("`", "'")
-
 
 def album_totals(albums):
     v = sum(1 for a in albums for k, _ in a["items"] if k == "video")
     p = sum(1 for a in albums for k, _ in a["items"] if k == "image")
     return v, p
-
 
 def describe_albums(albums, limit=10):
     lines = []
@@ -552,7 +552,6 @@ def describe_albums(albums, limit=10):
         lines.append(f"...and {len(albums) - limit} more albums")
     return "\n".join(lines)
 
-
 def albums_panel_text(albums):
     v_total, p_total = album_totals(albums)
     text = (
@@ -562,7 +561,6 @@ def albums_panel_text(albums):
     if albums:
         text += f"\n```text\n{describe_albums(albums)}\n```\n"
     return text
-
 
 async def show_site_panel(client, user_id, site, override_html=None):
     discover_sites()
@@ -594,10 +592,10 @@ async def show_site_panel(client, user_id, site, override_html=None):
         f"{source_note}\n"
         f"{albums_panel_text(albums)}"
         f"{err_txt}\n"
+        f"প্রতি স্ক্যানে সর্বোচ্চ **{MAX_ALBUMS_PER_SCAN}**টি নতুন অ্যালবাম প্রসেস হবে।\n"
         f"স্ক্যান শুরু করতে বা নতুন HTML ফাইল দিতে নিচের বাটনে ক্লিক করুন:",
         get_site_keyboard(site["key"])
     )
-
 
 # ================= কমান্ড ও কলব্যাক হ্যান্ডলার =================
 @bot.on_message(filters.command("start") & filters.private)
@@ -626,14 +624,15 @@ async def start_cmd(client, message):
     welcome_text = (
         "🤖 **Modular Website Scraper Dashboard**\n\n"
         f"⚡ **Telethon Engine:** `{engine_status}`\n"
-        f"📦 **Storage Channel:** `{STORAGE_CHANNEL_ID}`\n\n"
+        f"📦 **Storage Channel:** `{STORAGE_CHANNEL_ID}`\n"
+        f"📌 **Albums per Scan:** `{MAX_ALBUMS_PER_SCAN}`\n"
+        f"🏷️ **Default Hashtag:** `{DEFAULT_HASHTAG}`\n\n"
         f"📂 **Loaded Website Modules ({len(loaded_sites)}):**\n{sites_list}\n\n"
         "নিচের মেনু কিবোর্ড থেকে যেকোনো ওয়েবসাইট সিলেক্ট করে স্ক্যান শুরু করুন:"
     )
     await reset_panel(client, user_id)
     await refresh_menu(client, user_id)
     await update_panel(client, user_id, welcome_text, get_home_keyboard())
-
 
 @bot.on_message(filters.command("backup") & filters.private)
 async def backup_cmd(client, message):
@@ -647,7 +646,6 @@ async def backup_cmd(client, message):
     ok, info = await do_backup()
     text = f"✅ **BACKUP COMPLETED**\n• **Time:** `{info}`" if ok else f"❌ **BACKUP FAILED**\n• **Reason:** `{info}`"
     await update_panel(client, user_id, text, get_home_keyboard())
-
 
 @bot.on_callback_query()
 async def handle_callbacks(client, cq):
@@ -672,7 +670,8 @@ async def handle_callbacks(client, cq):
             await update_panel(
                 client, user_id,
                 f"🤖 **Modular Website Scraper Dashboard**\n\n"
-                f"⚡ **Telethon Engine:** `{engine_status}`\n\n"
+                f"⚡ **Telethon Engine:** `{engine_status}`\n"
+                f"📌 **Albums per Scan:** `{MAX_ALBUMS_PER_SCAN}`\n\n"
                 f"📂 **Loaded Website Modules ({len(loaded_sites)}):**\n{sites_list}",
                 get_home_keyboard()
             )
@@ -688,231 +687,137 @@ async def handle_callbacks(client, cq):
             count = 0
             async for msg in telethon_client.iter_messages(STORAGE_CHANNEL_ID, limit=500):
                 if msg.text:
-                    for u in re.findall(r'https?://[^\s"\'<>]+', msg.text):
-                        mark_as_uploaded(u, "#synced")
-                count += 1
+                    for u in re.findall(r'https?://[^\s"\'<>]+', msg.text or ""):
+                        if not is_duplicate(u):
+                            mark_as_uploaded(u, DEFAULT_HASHTAG)
+                            count += 1
+                if msg.media and getattr(msg, "file", None):
+                    pass
+            await update_panel(client, user_id, f"✅ **Sync Completed**\n• New media marked: `{count}`", get_home_keyboard())
 
-            await update_panel(
-                client, user_id,
-                f"✅ **CHANNEL SYNC COMPLETED**\n\n• **Scanned Messages:** `{count} recent posts`",
-                get_home_keyboard()
-            )
-
-        elif data.startswith("site_html_"):
-            site_key = data[len("site_html_"):]
-            site = loaded_sites.get(site_key)
-            if not site:
-                await cq.answer("⚠️ Site file not found!", show_alert=True)
-                return
-            sess["state"] = "WAITING_SITE_HTML"
-            sess["active_site_key"] = site_key
-            await update_panel(
-                client, user_id,
-                f"📄 **Send HTML for `{safe(site['name'])}`**\n\n"
-                f"এখন এই সাইটের `.html` ফাইল আপলোড করুন অথবা কোড পেস্ট করুন।\n"
-                f"*(বট `{site['path']}` ফাইলের নিয়ম অনুযায়ী ভিডিও ও অ্যালবাম খুঁজে বের করবে)*",
-                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"site_back_{site_key}")]])
-            )
-
-        elif data.startswith("site_back_"):
-            site_key = data[len("site_back_"):]
-            site = loaded_sites.get(site_key)
-            if site:
-                override = sess.get("custom_html", {}).get(site_key)
-                await show_site_panel(client, user_id, site, override)
+        elif data == "action_cancel_scan":
+            state = active_scans.get(user_id)
+            if state:
+                state["cancel"] = True
+                await cq.answer("Cancelling scan...")
+            else:
+                await cq.answer("No active scan.")
 
         elif data.startswith("site_scan_"):
-            site_key = data[len("site_scan_"):]
-            discover_sites()
+            site_key = data.replace("site_scan_", "", 1)
             site = loaded_sites.get(site_key)
             if not site:
-                await cq.answer("⚠️ Site file not found!", show_alert=True)
+                await cq.answer("Site not found!")
                 return
-            override = sess.get("custom_html", {}).get(site_key)
+            await cq.answer("Starting scan...")
+            override = sess.get("custom_html", {}).get(site_key) or db_get_site_html(site_key)
             started = await start_scan(client, user_id, site, override)
             if not started:
-                await cq.answer("⚠️ A scan is already running!", show_alert=True)
+                await update_panel(client, user_id, "⚠️ একটি স্ক্যান ইতিমধ্যে চলছে। আগে সেটা শেষ করুন অথবা ক্যানসেল করুন।", get_site_keyboard(site_key))
+
+        elif data.startswith("site_html_"):
+            site_key = data.replace("site_html_", "", 1)
+            site = loaded_sites.get(site_key)
+            if not site:
+                await cq.answer("Site not found!")
                 return
-            await cq.answer("Scan started!")
-            return
+            sess["state"] = "WAITING_HTML"
+            sess["active_site_key"] = site_key
+            await cq.answer()
+            await update_panel(
+                client, user_id,
+                f"📄 **{safe(site['name'])}** এর জন্য নতুন HTML পাঠান\n\n"
+                f"• `.html` ফাইল আপলোড করুন অথবা\n"
+                f"• HTML কোড সরাসরি পেস্ট করুন\n\n"
+                f"পাঠানোর পর অটো সেভ হয়ে যাবে।",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]])
+            )
 
-        elif data == "scan_cancel":
-            st = active_scans.get(user_id)
-            if st and not st["task"].done():
-                st["cancel"] = True
-                await cq.answer("Stopping scan...")
-            else:
-                await cq.answer("No active scan.", show_alert=True)
-            return
-
-        await cq.answer()
     except Exception as e:
-        err_trace = traceback.format_exc()
-        await update_panel(
-            client, user_id,
-            f"❌ **CALLBACK ERROR**\n`{type(e).__name__}: {str(e)}`\n```python\n{err_trace[-900:]}\n```",
-            get_home_keyboard()
-        )
+        print(f"Callback error: {e}")
+        traceback.print_exc()
 
-
-# ================= টেক্সট ও ফাইল ইনপুট =================
-@bot.on_message(filters.text & filters.private)
-async def handle_text_input(client, message):
+@bot.on_message(filters.private & filters.text & \~filters.command(["start", "backup"]))
+async def handle_text(client, message):
     user_id = message.from_user.id
-    text = message.text.strip()
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
+    text = (message.text or "").strip()
     sess = user_sessions.setdefault(user_id, {"state": "IDLE", "custom_html": {}})
 
+    # Reply keyboard থেকে সাইট সিলেক্ট
     if text.startswith(SITE_PREFIX):
-        discover_sites()
         site = find_site_by_label(text)
         if site:
-            override = sess.get("custom_html", {}).get(site["key"])
-            await show_site_panel(client, user_id, site, override)
+            await show_site_panel(client, user_id, site)
             return
 
-    if sess.get("state") == "WAITING_SITE_HTML":
+    # HTML পেস্ট করা হলে
+    if sess.get("state") == "WAITING_HTML":
         site_key = sess.get("active_site_key")
         site = loaded_sites.get(site_key)
-        if site:
-            save_site_html(site["key"], message.text)
-            await show_site_panel(client, user_id, site, override_html=message.text)
+        if site and text and ("<html" in text.lower() or "<!doctype" in text.lower() or "div" in text.lower()):
+            save_site_html(site_key, text)
+            sess.setdefault("custom_html", {})[site_key] = text
+            sess["state"] = "IDLE"
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await show_site_panel(client, user_id, site, override_html=text)
+            return
 
-
-@bot.on_message(filters.document & filters.private)
-async def handle_document_input(client, message):
+@bot.on_message(filters.private & filters.document)
+async def handle_document(client, message):
     user_id = message.from_user.id
     sess = user_sessions.setdefault(user_id, {"state": "IDLE", "custom_html": {}})
-    site_key = sess.get("active_site_key")
-    site = loaded_sites.get(site_key) if site_key else None
-
-    if not site and len(loaded_sites) == 1:
-        site = next(iter(loaded_sites.values()))
-
-    if not site:
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        await update_panel(client, user_id, "⚠️ আগে নিচের মেনু থেকে একটি ওয়েবসাইট বাটন সিলেক্ট করুন, তারপর HTML ফাইল দিন।", get_home_keyboard())
+    if sess.get("state") != "WAITING_HTML":
         return
 
-    file_path = None
+    site_key = sess.get("active_site_key")
+    site = loaded_sites.get(site_key)
+    if not site:
+        return
+
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith((".html", ".htm", ".txt")):
+        await message.reply("শুধু `.html` বা `.txt` ফাইল সাপোর্ট করে।")
+        return
+
+    path = await message.download()
     try:
-        file_path = await message.download()
-        try:
-            await message.delete()
-        except Exception:
-            pass
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
             html_content = f.read()
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        save_site_html(site["key"], html_content)
+        save_site_html(site_key, html_content)
+        sess.setdefault("custom_html", {})[site_key] = html_content
+        sess["state"] = "IDLE"
         await show_site_panel(client, user_id, site, override_html=html_content)
-    except Exception as e:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-        await update_panel(client, user_id, f"❌ **File Read Error:** `{e}`", get_home_keyboard())
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
 
-
-# ================= ডাউনলোড ও আপলোড ইঞ্জিন =================
-class ScanCancelled(BaseException):
-    pass
-
-
-active_scans = {}
-
-
-def get_cancel_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancel Scan", callback_data="scan_cancel")]])
-
-
-def check_cancel(state):
-    if state and state.get("cancel"):
-        raise ScanCancelled()
-
-
-async def cancellable_sleep(seconds, state):
-    end = time.monotonic() + seconds
-    while time.monotonic() < end:
-        check_cancel(state)
-        await asyncio.sleep(min(1, max(0, end - time.monotonic())))
-
-
-async def run_cancellable(coro, state):
-    task = asyncio.ensure_future(coro)
-    try:
-        while not task.done():
-            await asyncio.wait({task}, timeout=1)
-            if state.get("cancel") and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                raise ScanCancelled()
-        return task.result()
-    except asyncio.CancelledError:
-        task.cancel()
-        raise
-
-
-def url_ext(url, kind):
+# ================= ডাউনলোড ও আপলোড লজিক =================
+def url_ext(url, kind="video"):
     path = urlparse(url).path.lower()
-    for e in (".mp4", ".jpg", ".jpeg", ".png", ".webp"):
-        if path.endswith(e):
-            return e
+    for ext in (".mp4", ".m4v", ".webm", ".mov", ".jpg", ".jpeg", ".png", ".webp"):
+        if path.endswith(ext):
+            return ext
     return ".mp4" if kind == "video" else ".jpg"
 
-
-def build_request_headers(url, site_mod):
-    """ওয়েবসাইটের ফাইলে কাস্টম হেডার বা রেফারার থাকলে সেটি ব্যবহার করবে"""
-    parsed = urlparse(url)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Referer": getattr(site_mod, "REFERER", f"{parsed.scheme}://{parsed.netloc}/")
-    }
-    if hasattr(site_mod, "HEADERS") and isinstance(site_mod.HEADERS, dict):
-        headers.update(site_mod.HEADERS)
-    if hasattr(site_mod, "get_headers"):
-        custom = site_mod.get_headers(url)
-        if isinstance(custom, dict):
-            headers.update(custom)
-    return headers
-
-
-async def download_file_with_details(url, dest_path, site_mod, state=None, progress_cb=None, max_bytes=None):
-    # সাইট ফাইলে যদি নিজস্ব download_file ফাংশন থাকে তবে সেটি কল হবে
+async def download_file_with_details(url, dest_path, site_mod, state, progress_cb=None, max_bytes=None):
+    # সাইট মডিউলে custom_download থাকলে সেটা ব্যবহার করবে
     if hasattr(site_mod, "custom_download"):
-        try:
-            return await site_mod.custom_download(url, dest_path, state, progress_cb, max_bytes)
-        except asyncio.CancelledError:
-            # সাইট ফাইল ক্যানসেল করলে স্ক্যান ক্যানসেল হিসেবে ধরা হবে
-            if state and state.get("cancel"):
-                raise ScanCancelled()
-            raise
+        return await site_mod.custom_download(url, dest_path, state, progress_cb, max_bytes)
 
-    headers = build_request_headers(url, site_mod)
-    last_err = "Unknown error"
+    last_err = "Unknown"
     for attempt in range(1, 4):
         try:
-            timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
-            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-                async with session.get(url) as resp:
+            check_cancel(state)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
                     if resp.status != 200:
-                        return False, f"HTTP Error {resp.status} ({resp.reason}) - Server blocked or file removed."
-
-                    total = resp.content_length or 0
-                    if max_bytes and total and total > max_bytes:
-                        return False, f"File too large ({total // (1024 * 1024)} MB)."
-
+                        return False, f"HTTP {resp.status}"
+                    total = int(resp.headers.get("Content-Length") or 0)
                     downloaded = 0
-                    last_cb = time.monotonic()
+                    last_cb = 0
                     with open(dest_path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(1024 * 1024):
                             if state and state.get("cancel"):
@@ -927,29 +832,20 @@ async def download_file_with_details(url, dest_path, site_mod, state=None, progr
                                     await progress_cb(downloaded, total)
                                 except Exception:
                                     pass
-
             if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
                 return False, "Downloaded file is 0 bytes."
             return True, "OK"
-
         except ScanCancelled:
             raise
         except Exception as e:
             last_err = f"{type(e).__name__}: {str(e)}"
-
         if os.path.exists(dest_path):
             os.remove(dest_path)
         await cancellable_sleep(3 * attempt, state)
-
     return False, f"{last_err} (failed after 3 attempts)"
 
-
-# [CHANGED] রিটার্ন: (প্রথম ফাইলের ক্যাপশন, বাকি ফাইলের ক্যাপশন, শুধু-হ্যাশট্যাগ ক্যাপশন)
-#   first    = টাইটেল + হ্যাশট্যাগ  (অ্যালবামের প্রথম ফাইল)
-#   rest     = শুধু হ্যাশট্যাগ (REST_CAPTION_HASHTAG=0 হলে ফাঁকা)
-#   tag_only = ফলব্যাকে সিঙ্গেল আপলোডের ক্যাপশন (সবসময় শুধু হ্যাশট্যাগ)
 def build_caption(title, a_idx, total_albums, part, multi_part, hashtag):
-    single_tag = "#" + hashtag.lstrip("#").split()[0] if hashtag else "#mmsdesi"
+    single_tag = "#" + hashtag.lstrip("#").split()[0] if hashtag else DEFAULT_HASHTAG
     tag_html = htmllib.escape(single_tag)
     clean_title = re.sub(r"#\S+", "", title or "").strip()
     if clean_title:
@@ -959,9 +855,6 @@ def build_caption(title, a_idx, total_albums, part, multi_part, hashtag):
     rest = tag_html if REST_CAPTION_HASHTAG else ""
     return first, rest, tag_html
 
-
-# uploader = {"type": "telethon"/"pyrogram", "client": ..., "name": ...}
-# প্রতিটি অ্যালবাম একটিমাত্র uploader (অ্যাকাউন্ট) দিয়েই সম্পূর্ণ আপলোড হবে
 async def send_album(files, caption, uploader=None):
     first_cap, rest_cap = caption[0], caption[1]
     tclient = None
@@ -984,7 +877,6 @@ async def send_album(files, caption, uploader=None):
                 supports_streaming=(files[0]["kind"] == "video")
             )
         else:
-            # [CHANGED] প্রথম ফাইলে টাইটেল+হ্যাশট্যাগ, বাকিতে শুধু হ্যাশট্যাগ
             caps = [first_cap] + [rest_cap] * (len(paths) - 1)
             await tclient.send_file(
                 STORAGE_CHANNEL_ID, paths,
@@ -1007,14 +899,12 @@ async def send_album(files, caption, uploader=None):
         else:
             media = []
             for i, f in enumerate(files):
-                # [CHANGED] প্রথম ফাইলে টাইটেল+হ্যাশট্যাগ, বাকিতে শুধু হ্যাশট্যাগ
                 cap = first_cap if i == 0 else rest_cap
                 if f["kind"] == "video":
                     media.append(InputMediaVideo(f["path"], caption=cap, parse_mode=enums.ParseMode.HTML, supports_streaming=True))
                 else:
                     media.append(InputMediaPhoto(f["path"], caption=cap, parse_mode=enums.ParseMode.HTML))
             await pc.send_media_group(STORAGE_CHANNEL_ID, media)
-
 
 async def send_with_flood_retry(files, caption, state, uploader=None):
     for _ in range(3):
@@ -1026,7 +916,6 @@ async def send_with_flood_retry(files, caption, state, uploader=None):
             await cancellable_sleep(min(wait_sec + 1, 600), state)
     raise RuntimeError("Too many FloodWait retries")
 
-
 async def send_batch(files, caption, state, uploader=None):
     try:
         await send_with_flood_retry(files, caption, state, uploader)
@@ -1037,7 +926,6 @@ async def send_batch(files, caption, state, uploader=None):
         if len(files) == 1:
             return [], [(files[0]["url"], f"{type(first_err).__name__}: {first_err}")]
 
-        # সিঙ্গেল ফলব্যাকের আগে একবার অ্যালবাম রিট্রাই
         print(f"⚠️ Album send failed ({type(first_err).__name__}: {first_err}) - retrying once...")
         await cancellable_sleep(3, state)
         try:
@@ -1048,7 +936,6 @@ async def send_batch(files, caption, state, uploader=None):
         except Exception as second_err:
             print(f"⚠️ Album retry failed, fallback to single: {type(second_err).__name__}: {second_err}")
 
-        # [CHANGED] ফলব্যাক: যেগুলো ফেল করবে সেগুলো সিঙ্গেল আপলোড হবে, ক্যাপশনে শুধু হ্যাশট্যাগ
         tag_only = caption[2]
         ok_files, failed = [], []
         for f in files:
@@ -1060,7 +947,6 @@ async def send_batch(files, caption, state, uploader=None):
             except Exception as e:
                 failed.append((f["url"], f"{type(e).__name__}: {e}"))
         return ok_files, failed
-
 
 async def upload_album_batch(batch, title, a_idx, total_albums, part, multi_part, hashtag, state, uploader=None):
     caption = build_caption(title, a_idx, total_albums, part, multi_part, hashtag)
@@ -1074,13 +960,11 @@ async def upload_album_batch(batch, title, a_idx, total_albums, part, multi_part
         mark_as_uploaded(f["url"], hashtag)
     return ok_files, failed
 
-
 def tally(ok_files, failed, a_idx):
     v = sum(1 for f in ok_files if f["kind"] == "video")
     p = len(ok_files) - v
     errs = [f"• [Album {a_idx} Upload Failed]\n  URL: {u[:45]}...\n  Reason: {e}" for u, e in failed]
     return v, p, errs
-
 
 async def send_channel_text(text_html):
     try:
@@ -1091,7 +975,6 @@ async def send_channel_text(text_html):
             await bot.send_message(STORAGE_CHANNEL_ID, text_html, parse_mode=enums.ParseMode.HTML)
     except Exception as e:
         print(f"⚠️ Could not send album report: {e}")
-
 
 async def start_scan(client, user_id, site, override_html=None):
     old = active_scans.get(user_id)
@@ -1105,10 +988,7 @@ async def start_scan(client, user_id, site, override_html=None):
     active_scans[user_id] = state
     return True
 
-
 async def build_uploaders():
-    """প্রতিটি রেডি অ্যাকাউন্ট (Pyrogram User / Telethon) একটি করে worker। কিছু না থাকলে Pyrogram বট।
-    [CHANGED] একই টেলিগ্রাম অ্যাকাউন্ট Pyrogram ও Telethon দুই সেশনে থাকলে একবারই worker হবে।"""
     uploaders = []
     seen_ids = set()
     for name, c in pyro_ready:
@@ -1131,20 +1011,19 @@ async def build_uploaders():
             uid = None
         if uid is not None:
             if uid in seen_ids:
-                continue  # এই অ্যাকাউন্ট আগেই worker হিসেবে আছে
+                continue
             seen_ids.add(uid)
         uploaders.append({"type": "telethon", "client": c, "name": f"Telethon {i}"})
     if not uploaders:
         uploaders.append({"type": "pyrogram", "client": bot, "name": "Bot Token"})
     return uploaders
 
-
 async def process_and_upload(client, user_id, site, override_html=None, state=None):
     if state is None:
         state = {"cancel": False}
     site_key = site["key"]
     site_mod = site["module"]
-    hashtag = site["hashtag"]
+    hashtag = DEFAULT_HASHTAG   # জোর করে #newweb ব্যবহার
     end_kb = get_site_keyboard(site_key)
     cancel_kb = get_cancel_keyboard()
 
@@ -1155,7 +1034,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
     title = site["name"]
     total_albums = 0
     uploader_mode = "Pyrogram Bot Token"
-    workers = {}  # wid -> {"name", "a_idx", "title", "action", "bytes"}
+    workers = {}
     last_panel = [0.0]
 
     def progress_text(header_action="", extra=""):
@@ -1174,6 +1053,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         return (
             f"⏳ **Scanning `{safe(site['name'])}`**\n\n"
             f"⚡ **Engine:** `{uploader_mode}`\n"
+            f"📌 **Batch Limit:** `{MAX_ALBUMS_PER_SCAN}` albums\n"
             f"{body}\n"
             f"{extra}"
             f"✅ **Uploaded:** `{up_v} videos, {up_p} photos` | ❌ **Failed:** `{len(errors)}` | 📁 **Albums Done:** `{albums_done}/{total_albums}`"
@@ -1192,14 +1072,39 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
     try:
         await update_panel(client, user_id, f"🔍 **Running parser `{site['path']}`...**", cancel_kb)
         title, albums = get_site_albums(site, override_html)
+
+        # ========== শুধুমাত্র নতুন ২০টা অ্যালবাম ফিল্টার ==========
+        new_albums = []
+        for album in albums:
+            items = album.get("items") or []
+            if not items:
+                continue
+
+            first_url = items[0][1] if items else ""
+            akey = make_album_key(site_key, album.get("title"), first_url)
+
+            if is_album_processed(akey):
+                continue
+
+            # সব মিডিয়া আগে থেকেই আপলোড আছে কিনা
+            if all(is_duplicate(url) for _, url in items):
+                mark_album_processed(akey, site_key, album.get("title"))
+                continue
+
+            new_albums.append(album)
+            if len(new_albums) >= MAX_ALBUMS_PER_SCAN:
+                break
+
+        albums = new_albums
         total_albums = len(albums)
 
         if not albums:
             await update_panel(
                 client, user_id,
-                f"⚠️ **NO MEDIA FOUND FOR `{safe(site['name'])}`**\n\n"
-                f"• **File:** `{site['path']}`\n"
-                f"• `HTML_CONTENT` খালি থাকলে চ্যাটে `.html` ফাইল আপলোড করুন অথবা সাইট ফাইলের ভেতরে পেস্ট করুন।",
+                f"✅ **কোনো নতুন অ্যালবাম নেই**\n\n"
+                f"• সাইট: `{safe(site['name'])}`\n"
+                f"• সব অ্যালবাম আগেই স্ক্যান করা হয়েছে অথবা স্টোরেজ চ্যানেলে আছে।\n"
+                f"• নতুন HTML দিয়ে আবার চেষ্টা করুন।",
                 end_kb
             )
             return
@@ -1212,10 +1117,10 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         else:
             uploader_mode = f"{len(uploaders)} User Accounts (Album-level parallel)"
 
-        # ---------- ধাপ ১: সব অ্যালবামের জব তৈরি (ডুপ্লিকেট ফিল্টার, সিরিয়াল ঠিক রেখে) ----------
+        # জব কিউ তৈরি
         seen_run = set()
         queue = asyncio.Queue()
-        prev_done = None  # [NEW] আগের অ্যালবামের "শেষ হয়েছে" ইভেন্ট (ORDERED_ALBUMS-এর জন্য)
+        prev_done = None
         for a_idx, album in enumerate(albums, start=1):
             all_items = album["items"]
             v_found = sum(1 for k, _ in all_items if k == "video")
@@ -1237,7 +1142,12 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                 items.append((kind, url))
 
             if not items:
+                # পুরো অ্যালবাম আগেই আপলোড → মার্ক করে দিই
+                first_url = all_items[0][1] if all_items else ""
+                akey = make_album_key(site_key, album.get("title"), first_url)
+                mark_album_processed(akey, site_key, album.get("title"))
                 continue
+
             done_ev = asyncio.Event()
             queue.put_nowait({
                 "a_idx": a_idx, "album": album, "items": items, "all_items": all_items,
@@ -1246,7 +1156,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             })
             prev_done = done_ev
 
-        # ---------- ধাপ ২: একটি অ্যালবাম = একটি অ্যাকাউন্ট, সম্পূর্ণ সিরিয়ালি ----------
         async def process_album(job, uploader, wid):
             nonlocal up_v, up_p, albums_done
             a_idx = job["a_idx"]
@@ -1258,7 +1167,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
 
             a_up_v = a_up_p = a_fail = 0
             part = 0
-            waited = False  # [NEW] আগের অ্যালবামের জন্য অপেক্ষা একবারই করবে
+            waited = False
             sem = asyncio.Semaphore(DOWNLOAD_PARALLEL)
 
             async def dl_one(item_idx, kind, url):
@@ -1293,7 +1202,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                     ws["action"] = f"⬇️ Downloading `{start + 1}-{start + len(chunk)}/{len(items)}` (parallel x{min(DOWNLOAD_PARALLEL, len(chunk))})"
                     await refresh(force=True)
 
-                    # অ্যালবামের ভেতরে প্যারালাল ডাউনলোড - gather রেজাল্ট ইনপুট সিরিয়ালেই ফেরত দেয়
                     results = await asyncio.gather(*[
                         dl_one(start + off + 1, kind, url)
                         for off, (kind, url) in enumerate(chunk)
@@ -1310,7 +1218,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                             errors.append(r["err"])
                             a_fail += 1
 
-                    # সাইজ লিমিট অনুযায়ী ভাগ (সিরিয়াল অপরিবর্তিত)
                     groups, cur, cur_bytes = [], [], 0
                     for f in downloaded_files:
                         if cur and cur_bytes + f["size"] > MAX_BATCH_BYTES:
@@ -1321,12 +1228,9 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                     if cur:
                         groups.append(cur)
 
-                    # আপলোড: একই অ্যাকাউন্টে, একটার পর একটা পার্ট (প্রতি পার্ট = একটি অ্যালবাম পোস্ট, সর্বোচ্চ ১০ ফাইল)
                     for g in groups:
                         check_cancel(state)
 
-                        # [NEW] ক্রম অনুযায়ী পোস্ট: আগের অ্যালবাম শেষ না হওয়া পর্যন্ত আপলোড শুরু হবে না
-                        # (ডাউনলোড আগেই হয়ে থাকে, তাই স্পিড বেশি নষ্ট হয় না)
                         if ORDERED_ALBUMS and not waited and job.get("prev_done") is not None:
                             ws["action"] = "⏳ আগের অ্যালবামের জন্য অপেক্ষা..."
                             await refresh(force=True)
@@ -1357,7 +1261,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                     except Exception:
                         pass
 
-            # [KEPT] একটি অ্যালবাম সম্পূর্ণ আপলোড হলে স্টোরেজ চ্যানেলে রিপোর্ট মেসেজ
+            # অ্যালবাম কমপ্লিট রিপোর্ট
             report = (
                 f"✅ <b>Album {a_idx}/{total_albums} completed</b>\n"
                 f"📁 {htmllib.escape(album['title'][:200])}\n"
@@ -1368,6 +1272,12 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             if a_fail:
                 report += f"\n⚠️ Failed: {a_fail}"
             await send_channel_text(report)
+
+            # অ্যালবাম প্রসেসড হিসেবে মার্ক
+            first_url = all_items[0][1] if all_items else ""
+            akey = make_album_key(site_key, album.get("title"), first_url)
+            mark_album_processed(akey, site_key, album.get("title"))
+
             albums_done += 1
             ws.update({"a_idx": 0, "action": "✅ Idle", "bytes": {}})
             await refresh(force=True)
@@ -1391,7 +1301,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                     )
                     workers[wid].update({"a_idx": 0, "bytes": {}})
                 finally:
-                    # [NEW] সফল/ফেল/ক্যানসেল যাই হোক, পরের অ্যালবামকে ছেড়ে দাও - যাতে আটকে না থাকে
                     job["done"].set()
 
         tasks = [asyncio.create_task(worker(i, u)) for i, u in enumerate(uploaders)]
@@ -1436,7 +1345,8 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         f"{head}\n\n"
         f"⚡ **Engine Used:** `{uploader_mode}`\n"
         f"🌐 **Website:** `{safe(site['name'])}`\n"
-        f"🏷️ **Section Tag:** `{hashtag}`\n"
+        f"🏷️ **Hashtag:** `{hashtag}`\n"
+        f"📌 **Batch Limit:** `{MAX_ALBUMS_PER_SCAN}` albums\n"
         f"📁 **Albums Completed:** `{albums_done}/{total_albums}`\n"
         f"🎬 **Videos Uploaded:** `{up_v}`\n"
         f"🖼️ **Photos Uploaded:** `{up_p}`\n"
@@ -1451,20 +1361,16 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
 
     await update_panel(client, user_id, summary_text, end_kb)
 
-
 # ================= Render Web Service Port Binding =================
 web_app = Flask(__name__)
 
-
 @web_app.route("/")
 def home():
-    return f"Modular Scraper Bot is Running! Loaded sites: {len(loaded_sites)}"
-
+    return f"Modular Scraper Bot is Running! Loaded sites: {len(loaded_sites)} | Max albums/scan: {MAX_ALBUMS_PER_SCAN}"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     web_app.run(host="0.0.0.0", port=port)
-
 
 async def main():
     global backup_event
@@ -1475,7 +1381,6 @@ async def main():
         status = f"Restore error: {e}"
     print(f"💾 {status}")
 
-    # Pyrogram User Session আপলোডার অ্যাকাউন্ট স্টার্ট
     for i, pc in enumerate(pyro_clients, start=1):
         try:
             await pc.start()
@@ -1483,7 +1388,6 @@ async def main():
             try:
                 await pc.get_chat(STORAGE_CHANNEL_ID)
             except Exception:
-                # in_memory সেশনে চ্যানেল পিয়ার ক্যাশ করতে ডায়ালগ লোড করা হয়
                 async for _d in pc.get_dialogs():
                     pass
                 await pc.get_chat(STORAGE_CHANNEL_ID)
@@ -1494,7 +1398,9 @@ async def main():
 
     backup_event = asyncio.Event()
     worker = asyncio.create_task(backup_worker())
-    print(f"🤖 Bot is running. Loaded {len(loaded_sites)} site modules. Pyrogram uploader accounts: {len(pyro_ready)} | Telethon accounts: {len(telethon_clients)}")
+    print(f"🤖 Bot is running. Loaded {len(loaded_sites)} site modules. "
+          f"Pyrogram uploader accounts: {len(pyro_ready)} | Telethon accounts: {len(telethon_clients)}")
+    print(f"📌 MAX_ALBUMS_PER_SCAN = {MAX_ALBUMS_PER_SCAN} | DEFAULT_HASHTAG = {DEFAULT_HASHTAG}")
 
     await idle()
 
@@ -1507,7 +1413,6 @@ async def main():
         except Exception:
             pass
     await bot.stop()
-
 
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
