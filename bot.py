@@ -127,6 +127,9 @@ RESOLVE_PARALLEL = max(1, int(os.environ.get("RESOLVE_PARALLEL", "3")))   # এ�
 
 # ========== Send Link ফিচারের সেটিংস ==========
 MAX_LINKS_QUEUE = 10              # একসাথে সর্বোচ্চ কয়টা লিংক কিউতে থাকতে পারবে (অ্যালবামের ফাইল সংখ্যার কোনো লিমিট নেই)
+# Send Link-এ একটি অ্যালবামের অংশগুলো (১০ ফাইলের গ্রুপ) দুই আইডিতে ভাগ হলে চ্যানেলে ক্রম ঠিক রাখবে কিনা
+# 1 = ক্রমানুসারে আপলোড (ডাউনলোড সমান্তরালে হয়), 0 = যে অংশ আগে তৈরি সেটা আগে যাবে (দ্রুততম)
+ORDERED_PARTS = os.environ.get("ORDERED_PARTS", "1") == "1"
 
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -1754,6 +1757,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
 # (ক্যাপশন + নিচে #newweb) → শেষে চ্যানেলে "Album completed" মেসেজ।
 # একসাথে সর্বোচ্চ MAX_LINKS_QUEUE টা লিংক কিউতে থাকে; একটা শেষ হলে পরেরটা শুরু হয়।
 # অ্যালবামের ফাইল সংখ্যার কোনো লিমিট নেই।
+# একটি অ্যালবামের অংশগুলো (১০ ফাইলের গ্রুপ) একাধিক আইডিতে ভাগ হয়ে সমান্তরালে আপলোড হয়।
 
 def extract_links(text):
     found = []
@@ -1900,7 +1904,7 @@ async def enqueue_links(client, user_id, site, links):
 
     return {"status": "ok", "job": job, "new_job": new_job, "added": added, "dup": dup, "rejected": rejected}
 
-async def process_one_link(client, user_id, job, uploader, url, seq):
+async def process_one_link(client, user_id, job, uploaders, url, seq):
     state = job["state"]
     site = job["site"]
     site_key = site["key"]
@@ -1964,9 +1968,25 @@ async def process_one_link(client, user_id, job, uploader, url, seq):
         return {"ok": True, "title": title, "v": 0, "p": 0, "fail": 0, "note": "আগেই আপলোড করা আছে"}
 
     a_up_v = a_up_p = a_fail = 0
-    part = 0
-    sem = asyncio.Semaphore(DOWNLOAD_PARALLEL)
+    n_workers = max(1, len(uploaders))
+    sem = asyncio.Semaphore(DOWNLOAD_PARALLEL * n_workers)
     bytes_map = {}
+
+    # অ্যালবামের ফাইলগুলো ১০টা করে অংশে ভাগ → কমন কিউ → যে আইডি আগে ফ্রি সে পরের অংশ নেয়
+    chunks = [items[i:i + MAX_ALBUM_BATCH] for i in range(0, len(items), MAX_ALBUM_BATCH)]
+    chunk_q = asyncio.Queue()
+    chunk_done = []
+    for ci, ch in enumerate(chunks):
+        chunk_q.put_nowait((ci, ch))
+        chunk_done.append(asyncio.Event())
+    actions = {}
+
+    def set_action(wname, text):
+        actions[wname] = text
+        if len(uploaders) <= 1:
+            job["action"] = text
+        else:
+            job["action"] = "\n   ".join(f"👤 {n}: {t}" for n, t in actions.items())
 
     async def dl_one(item_idx, kind, u):
         label = "Video" if kind == "video" else "Photo"
@@ -1994,57 +2014,96 @@ async def process_one_link(client, user_id, job, uploader, url, seq):
         size = os.path.getsize(temp)
         return {"ok": True, "file": {"path": temp, "kind": kind, "url": u, "size": size}}
 
-    try:
-        for start in range(0, len(items), MAX_ALBUM_BATCH):
-            check_cancel(state)
-            chunk = items[start:start + MAX_ALBUM_BATCH]
-            job["action"] = f"⬇️ Downloading `{start + 1}-{start + len(chunk)}/{len(items)}`"
-            await refresh_link_panel(client, user_id, job, force=True)
+    async def process_chunk(ci, chunk, uploader):
+        nonlocal a_up_v, a_up_p, a_fail
+        wname = uploader["name"]
+        start = ci * MAX_ALBUM_BATCH
+        check_cancel(state)
+        set_action(wname, f"⬇️ Downloading `{start + 1}-{start + len(chunk)}/{len(items)}`")
+        await refresh_link_panel(client, user_id, job, force=True)
 
-            results = await asyncio.gather(*[
-                dl_one(start + off + 1, kind, u)
-                for off, (kind, u) in enumerate(chunk)
-            ])
-            if any(r.get("cancelled") for r in results):
-                raise ScanCancelled()
-            check_cancel(state)
+        results = await asyncio.gather(*[
+            dl_one(start + off + 1, kind, u)
+            for off, (kind, u) in enumerate(chunk)
+        ])
+        if any(r.get("cancelled") for r in results):
+            raise ScanCancelled()
+        check_cancel(state)
 
-            downloaded_files = []
-            for r in results:
-                if r["ok"]:
-                    downloaded_files.append(r["file"])
-                else:
-                    a_fail += 1
+        downloaded_files = []
+        for r in results:
+            if r["ok"]:
+                downloaded_files.append(r["file"])
+            else:
+                a_fail += 1
 
-            groups, cur, cur_bytes = [], [], 0
-            for f in downloaded_files:
-                if cur and cur_bytes + f["size"] > MAX_BATCH_BYTES:
-                    groups.append(cur)
-                    cur, cur_bytes = [], 0
-                cur.append(f)
-                cur_bytes += f["size"]
-            if cur:
+        groups, cur, cur_bytes = [], [], 0
+        for f in downloaded_files:
+            if cur and cur_bytes + f["size"] > MAX_BATCH_BYTES:
                 groups.append(cur)
+                cur, cur_bytes = [], 0
+            cur.append(f)
+            cur_bytes += f["size"]
+        if cur:
+            groups.append(cur)
 
-            for g in groups:
-                check_cancel(state)
-                part += 1
-                mb = sum(f["size"] for f in g) // (1024 * 1024)
-                job["action"] = f"⬆️ Uploading Part `{part}`: `{len(g)} files, {mb} MB`"
-                job["mb"] = 0
-                bytes_map.clear()
+        waited = False
+        for g in groups:
+            check_cancel(state)
+
+            # ক্রম ঠিক রাখতে আগের অংশ আপলোড শেষ না হওয়া পর্যন্ত অপেক্ষা
+            if ORDERED_PARTS and ci > 0 and not waited:
+                set_action(wname, "⏳ আগের অংশের আপলোডের জন্য অপেক্ষা...")
                 await refresh_link_panel(client, user_id, job, force=True)
-                multi = len(items) > MAX_ALBUM_BATCH or part > 1
-                ok_files, failed = await upload_album_batch(
-                    g, title, seq, job["total"], part, multi, hashtag, state, uploader
-                )
-                v, p, errs = tally(ok_files, failed, seq)
-                a_up_v += v
-                a_up_p += p
-                job["up_v"] += v
-                job["up_p"] += p
-                a_fail += len(errs)
-                await cancellable_sleep(1, state)
+                await run_cancellable(chunk_done[ci - 1].wait(), state)
+                waited = True
+
+            mb = sum(f["size"] for f in g) // (1024 * 1024)
+            set_action(wname, f"⬆️ Uploading Part `{ci + 1}/{len(chunks)}`: `{len(g)} files, {mb} MB`")
+            await refresh_link_panel(client, user_id, job, force=True)
+            multi = len(items) > MAX_ALBUM_BATCH
+            ok_files, failed = await upload_album_batch(
+                g, title, seq, job["total"], ci + 1, multi, hashtag, state, uploader
+            )
+            v, p, errs = tally(ok_files, failed, seq)
+            a_up_v += v
+            a_up_p += p
+            job["up_v"] += v
+            job["up_p"] += p
+            a_fail += len(errs)
+            await cancellable_sleep(1, state)
+
+        set_action(wname, "✅ Idle")
+
+    async def link_worker(uploader):
+        nonlocal a_fail
+        while True:
+            check_cancel(state)
+            try:
+                ci, ch = chunk_q.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await process_chunk(ci, ch, uploader)
+            except ScanCancelled:
+                raise
+            except Exception as ce:
+                a_fail += len(ch)
+                print(f"⚠️ Link {seq} part {ci + 1} crashed ({uploader['name']}): {type(ce).__name__}: {ce}")
+            finally:
+                chunk_done[ci].set()
+
+    try:
+        outcomes = await asyncio.gather(
+            *[link_worker(u_) for u_ in uploaders],
+            return_exceptions=True
+        )
+        for o in outcomes:
+            if isinstance(o, ScanCancelled):
+                raise ScanCancelled()
+        for o in outcomes:
+            if isinstance(o, BaseException) and not isinstance(o, asyncio.CancelledError):
+                raise o
     finally:
         for fn in glob.glob(f"tmplink_{user_id}_{seq}_*"):
             try:
@@ -2089,8 +2148,12 @@ async def process_link_queue(client, user_id, job):
     try:
         job["action"] = "⏳ আপলোডার প্রস্তুত হচ্ছে..."
         uploaders = await build_uploaders()
-        uploader = uploaders[0]
-        job["engine"] = uploader["name"] if uploader["name"] == "Bot Token" else f"{uploader['name']} (User Session)"
+        if uploaders[0]["name"] == "Bot Token":
+            job["engine"] = "Bot Token"
+        elif len(uploaders) == 1:
+            job["engine"] = f"{uploaders[0]['name']} (User Session)"
+        else:
+            job["engine"] = f"{len(uploaders)} User Accounts (Parallel parts)"
 
         seq = 0
         while True:
@@ -2112,7 +2175,7 @@ async def process_link_queue(client, user_id, job):
             await refresh_link_panel(client, user_id, job, force=True)
 
             try:
-                res = await process_one_link(client, user_id, job, uploader, url, seq)
+                res = await process_one_link(client, user_id, job, uploaders, url, seq)
                 short = safe(res["title"])[:30]
                 if res["ok"]:
                     job["ok"] += 1
@@ -2233,7 +2296,7 @@ async def main():
     worker = asyncio.create_task(backup_worker())
     print(f"🤖 Bot is running. Loaded {len(loaded_sites)} site modules. "
           f"Pyrogram uploader accounts: {len(pyro_ready)} | Telethon accounts: {len(telethon_clients)}")
-    print(f"📌 MAX_ALBUMS_PER_SCAN = {MAX_ALBUMS_PER_SCAN} | DEFAULT_HASHTAG = {DEFAULT_HASHTAG} | MAX_LINKS_QUEUE = {MAX_LINKS_QUEUE}")
+    print(f"📌 MAX_ALBUMS_PER_SCAN = {MAX_ALBUMS_PER_SCAN} | DEFAULT_HASHTAG = {DEFAULT_HASHTAG} | MAX_LINKS_QUEUE = {MAX_LINKS_QUEUE} | ORDERED_PARTS = {ORDERED_PARTS}")
 
     await idle()
 
