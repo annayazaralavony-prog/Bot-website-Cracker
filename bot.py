@@ -33,6 +33,11 @@ try:
     from telethon import TelegramClient
     from telethon.sessions import StringSession
     from telethon.errors import FloodWaitError, RPCError as TelethonRPCError
+    try:
+        from telethon.errors import AuthKeyDuplicatedError
+    except ImportError:
+        class AuthKeyDuplicatedError(Exception):
+            pass
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
@@ -43,6 +48,9 @@ except ImportError:
         pass
 
     class TelethonRPCError(Exception):
+        pass
+
+    class AuthKeyDuplicatedError(Exception):
         pass
 
 # ================= কনফিগারেশন =================
@@ -102,7 +110,7 @@ MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "2000")) * 1024 * 1024
 MAX_BATCH_BYTES = int(os.environ.get("MAX_BATCH_MB", "2000")) * 1024 * 1024
 
 # ========== নতুন সেটিংস ==========
-MAX_ALBUMS_PER_SCAN = 20          # প্রতি স্ক্যানে সর্বোচ্চ কয়টা অ্যালবাম
+MAX_ALBUMS_PER_SCAN = 20          # প্রতি স্ক্যানে সর্বোচ্চ কয়টা অ্যালবাম
 DEFAULT_HASHTAG = "#newweb"       # ডিফল্ট হ্যাশট্যাগ
 REST_CAPTION_HASHTAG = os.environ.get("REST_CAPTION_HASHTAG", "1") == "1"
 ORDERED_ALBUMS = os.environ.get("ORDERED_ALBUMS", "1") == "1"
@@ -121,7 +129,24 @@ telethon_clients = []
 if TELETHON_AVAILABLE:
     for _sess in _collect_session_strings():
         telethon_clients.append(TelegramClient(StringSession(_sess), API_ID, API_HASH))
-telethon_client = telethon_clients[0] if telethon_clients else None
+
+# ---- Telethon সেশন স্টেট ট্র্যাকিং ----
+dead_telethon = {}      # id(client) -> কারণ (AuthKeyDuplicated ইত্যাদি হলে এখানে যাবে)
+connect_locks = {}      # id(client) -> asyncio.Lock (একসাথে দুইবার connect ঠেকাতে)
+primed_clients = set()  # যেসব ক্লায়েন্টের চ্যানেল entity লোড হয়েছে
+
+def mark_telethon_dead(c, reason):
+    if id(c) not in dead_telethon:
+        dead_telethon[id(c)] = reason
+        idx = telethon_clients.index(c) + 1 if c in telethon_clients else "?"
+        print(f"🔴 Telethon session #{idx} মারা গেছে: {reason}")
+
+def get_telethon():
+    """প্রথম জীবিত Telethon ক্লায়েন্ট ফেরত দেয়"""
+    for c in telethon_clients:
+        if id(c) not in dead_telethon:
+            return c
+    return None
 
 # ================= ডাটাবেস =================
 conn = None
@@ -148,7 +173,6 @@ def init_db():
             html TEXT
         )
     """)
-    # নতুন টেবিল: কোন অ্যালবাম প্রসেস হয়েছে ট্র্যাক করার জন্য
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS processed_albums (
             album_key TEXT PRIMARY KEY,
@@ -287,11 +311,12 @@ async def restore_db_from_telegram():
 
     if not path:
         t_ok, _ = await ensure_telethon_connected()
-        if t_ok:
+        tc = get_telethon()
+        if t_ok and tc is not None:
             try:
-                async for m in telethon_client.iter_messages(BACKUP_CHANNEL_ID, search=BACKUP_TAG, limit=20):
+                async for m in tc.iter_messages(BACKUP_CHANNEL_ID, search=BACKUP_TAG, limit=20):
                     if m.document:
-                        path = await telethon_client.download_media(m, "restore_tmp.db")
+                        path = await tc.download_media(m, "restore_tmp.db")
                         msg_id = m.id
                         break
             except Exception as e:
@@ -438,7 +463,7 @@ async def cancellable_sleep(seconds, state):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         check_cancel(state)
-        await asyncio.sleep(min(0.5, end - time.monotonic()))
+        await asyncio.sleep(max(0.01, min(0.5, end - time.monotonic())))
 
 async def run_cancellable(coro, state):
     check_cancel(state)
@@ -467,6 +492,12 @@ def build_sites_reply_keyboard():
         return None
     rows = [[KeyboardButton(f"{SITE_PREFIX}{s['name']}")] for s in loaded_sites.values()]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, placeholder="Select a website module...")
+
+async def safe_answer(cq, text=None):
+    try:
+        await cq.answer(text) if text else await cq.answer()
+    except Exception:
+        pass
 
 async def refresh_menu(client, user_id):
     session = user_sessions.setdefault(user_id, {})
@@ -519,20 +550,73 @@ async def reset_panel(client, user_id):
             pass
     session["panel_msg_id"] = None
 
+# ================= Telethon কানেকশন ম্যানেজমেন্ট =================
+async def prime_entity(c):
+    """নতুন StringSession-এ চ্যানেলের entity cache থাকে না, তাই আগে লোড করে নিই"""
+    try:
+        await c.get_entity(STORAGE_CHANNEL_ID)
+        return
+    except AuthKeyDuplicatedError:
+        raise
+    except Exception:
+        pass
+    try:
+        async for _d in c.iter_dialogs():
+            pass
+        await c.get_entity(STORAGE_CHANNEL_ID)
+    except AuthKeyDuplicatedError:
+        raise
+    except Exception as e:
+        print(f"⚠️ Telethon: স্টোরেজ চ্যানেল entity পাওয়া যায়নি: {type(e).__name__}: {e}")
+
 async def ensure_telethon_connected(tclient=None):
     if not TELETHON_AVAILABLE:
         return False, "Telethon not installed."
-    target = tclient if tclient is not None else telethon_client
+    target = tclient if tclient is not None else get_telethon()
     if not target:
+        if telethon_clients:
+            return False, "সব Telethon session অকেজো (AuthKeyDuplicated) - নতুন session দিন।"
         return False, "TELETHON_SESSION_STRING missing."
-    try:
-        if not target.is_connected():
-            await target.connect()
-        if not await target.is_user_authorized():
-            return False, "Telethon Session String invalid/expired."
+    if id(target) in dead_telethon:
+        return False, dead_telethon[id(target)]
+
+    # ইতিমধ্যে ভেরিফাইড ও কানেক্টেড হলে আর নেটওয়ার্ক কল নয়
+    if target.is_connected() and id(target) in primed_clients:
         return True, "Connected"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {str(e)}"
+
+    lock = connect_locks.setdefault(id(target), asyncio.Lock())
+    async with lock:
+        try:
+            if not target.is_connected():
+                await target.connect()
+            if not await target.is_user_authorized():
+                mark_telethon_dead(target, "Session String invalid/expired.")
+                return False, "Telethon Session String invalid/expired."
+            if id(target) not in primed_clients:
+                await prime_entity(target)
+                primed_clients.add(id(target))
+            return True, "Connected"
+        except AuthKeyDuplicatedError:
+            msg = "AuthKeyDuplicatedError: একই session একসাথে দুই IP-তে ব্যবহার হয়েছে। নতুন session বানান এবং অন্য সব জায়গায় বন্ধ করুন।"
+            mark_telethon_dead(target, msg)
+            try:
+                await target.disconnect()
+            except Exception:
+                pass
+            return False, msg
+        except Exception as e:
+            return False, f"{type(e).__name__}: {str(e)}"
+
+async def release_telethon():
+    """স্ক্যান না চললে Telethon কানেকশন বন্ধ রাখি (Railway overlap-এ সেশন ক্লাশ কমাতে)"""
+    if active_scans:
+        return
+    for c in telethon_clients:
+        try:
+            if c.is_connected():
+                await c.disconnect()
+        except Exception:
+            pass
 
 def safe(text):
     return str(text).replace("`", "'")
@@ -597,6 +681,14 @@ async def show_site_panel(client, user_id, site, override_html=None):
         get_site_keyboard(site["key"])
     )
 
+def engine_status_text(t_ok, t_status):
+    status = "🟢 Active (Telethon Session)" if t_ok else f"🔴 Inactive ({t_status})"
+    if t_ok:
+        alive = sum(1 for c in telethon_clients if id(c) not in dead_telethon)
+        if len(telethon_clients) > 1:
+            status = f"🟢 Active (Telethon x{alive}/{len(telethon_clients)} Accounts)"
+    return status
+
 # ================= কমান্ড ও কলব্যাক হ্যান্ডলার =================
 @bot.on_message(filters.command("start") & filters.private)
 async def start_cmd(client, message):
@@ -616,9 +708,8 @@ async def start_cmd(client, message):
     }
 
     t_ok, t_status = await ensure_telethon_connected()
-    engine_status = "🟢 Active (Telethon Session)" if t_ok else f"🔴 Inactive ({t_status})"
-    if t_ok and len(telethon_clients) > 1:
-        engine_status = f"🟢 Active (Telethon x{len(telethon_clients)} Accounts)"
+    engine_status = engine_status_text(t_ok, t_status)
+    await release_telethon()
     sites_list = "\n".join(f"• `{s['name']}` (`{s['path']}`)" for s in loaded_sites.values()) or "• `No site files found in sites/ folder`"
 
     welcome_text = (
@@ -660,12 +751,13 @@ async def handle_callbacks(client, cq):
             sess["state"] = "IDLE"
             if data == "action_reload_sites":
                 await refresh_menu(client, user_id)
-                await cq.answer(f"Reloaded {len(loaded_sites)} site files!")
+                await safe_answer(cq, f"Reloaded {len(loaded_sites)} site files!")
+            else:
+                await safe_answer(cq)
 
             t_ok, t_status = await ensure_telethon_connected()
-            engine_status = "🟢 Active (Telethon Session)" if t_ok else f"🔴 Inactive ({t_status})"
-            if t_ok and len(telethon_clients) > 1:
-                engine_status = f"🟢 Active (Telethon x{len(telethon_clients)} Accounts)"
+            engine_status = engine_status_text(t_ok, t_status)
+            await release_telethon()
             sites_list = "\n".join(f"• `{s['name']}` (`{s['path']}`)" for s in loaded_sites.values()) or "• `No site files found in sites/ folder`"
             await update_panel(
                 client, user_id,
@@ -677,7 +769,7 @@ async def handle_callbacks(client, cq):
             )
 
         elif data == "action_sync_channel":
-            await cq.answer("Syncing storage channel via Telethon...")
+            await safe_answer(cq, "Syncing storage channel via Telethon...")
             t_ok, t_err = await ensure_telethon_connected()
             if not t_ok:
                 await update_panel(client, user_id, f"❌ **TELETHON CONNECTION FAILED**\n\n`{t_err}`", get_home_keyboard())
@@ -685,31 +777,37 @@ async def handle_callbacks(client, cq):
 
             await update_panel(client, user_id, "🔄 **Scanning Storage Channel via Telethon...**")
             count = 0
-            async for msg in telethon_client.iter_messages(STORAGE_CHANNEL_ID, limit=500):
-                if msg.text:
-                    for u in re.findall(r'https?://[^\s"\'<>]+', msg.text or ""):
-                        if not is_duplicate(u):
-                            mark_as_uploaded(u, DEFAULT_HASHTAG)
-                            count += 1
-                if msg.media and getattr(msg, "file", None):
-                    pass
+            try:
+                tc = get_telethon()
+                async for msg in tc.iter_messages(STORAGE_CHANNEL_ID, limit=500):
+                    if msg.text:
+                        for u in re.findall(r'https?://[^\s"\'<>]+', msg.text or ""):
+                            if not is_duplicate(u):
+                                mark_as_uploaded(u, DEFAULT_HASHTAG)
+                                count += 1
+            except AuthKeyDuplicatedError:
+                mark_telethon_dead(get_telethon(), "AuthKeyDuplicatedError during sync")
+                await update_panel(client, user_id, "❌ **Telethon session AuthKeyDuplicated**\nনতুন session বানিয়ে দিন।", get_home_keyboard())
+                return
+            finally:
+                await release_telethon()
             await update_panel(client, user_id, f"✅ **Sync Completed**\n• New media marked: `{count}`", get_home_keyboard())
 
         elif data == "action_cancel_scan":
             state = active_scans.get(user_id)
             if state:
                 state["cancel"] = True
-                await cq.answer("Cancelling scan...")
+                await safe_answer(cq, "Cancelling scan...")
             else:
-                await cq.answer("No active scan.")
+                await safe_answer(cq, "No active scan.")
 
         elif data.startswith("site_scan_"):
             site_key = data.replace("site_scan_", "", 1)
             site = loaded_sites.get(site_key)
             if not site:
-                await cq.answer("Site not found!")
+                await safe_answer(cq, "Site not found!")
                 return
-            await cq.answer("Starting scan...")
+            await safe_answer(cq, "Starting scan...")
             override = sess.get("custom_html", {}).get(site_key) or db_get_site_html(site_key)
             started = await start_scan(client, user_id, site, override)
             if not started:
@@ -719,25 +817,31 @@ async def handle_callbacks(client, cq):
             site_key = data.replace("site_html_", "", 1)
             site = loaded_sites.get(site_key)
             if not site:
-                await cq.answer("Site not found!")
+                await safe_answer(cq, "Site not found!")
                 return
             sess["state"] = "WAITING_HTML"
             sess["active_site_key"] = site_key
-            await cq.answer()
+            await safe_answer(cq)
             await update_panel(
                 client, user_id,
                 f"📄 **{safe(site['name'])}** এর জন্য নতুন HTML পাঠান\n\n"
                 f"• `.html` ফাইল আপলোড করুন অথবা\n"
                 f"• HTML কোড সরাসরি পেস্ট করুন\n\n"
-                f"পাঠানোর পর অটো সেভ হয়ে যাবে।",
+                f"পাঠানোর পর অটো সেভ হয়ে যাবে।",
                 InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]])
             )
+        else:
+            await safe_answer(cq)
 
     except Exception as e:
         print(f"Callback error: {e}")
         traceback.print_exc()
+        try:
+            await update_panel(client, user_id, f"❌ **Error:** `{type(e).__name__}: {safe(e)}`", get_home_keyboard())
+        except Exception:
+            pass
 
-@bot.on_message(filters.private & filters.text & \~filters.command(["start", "backup"]))
+@bot.on_message(filters.private & filters.text & ~filters.command(["start", "backup"]))
 async def handle_text(client, message):
     user_id = message.from_user.id
     text = (message.text or "").strip()
@@ -754,7 +858,8 @@ async def handle_text(client, message):
     if sess.get("state") == "WAITING_HTML":
         site_key = sess.get("active_site_key")
         site = loaded_sites.get(site_key)
-        if site and text and ("<html" in text.lower() or "<!doctype" in text.lower() or "div" in text.lower()):
+        looks_like_html = bool(re.search(r"<\s*(!doctype|html|body|div|a\s|img|video|source)", text, re.I))
+        if site and text and looks_like_html:
             save_site_html(site_key, text)
             sess.setdefault("custom_html", {})[site_key] = text
             sess["state"] = "IDLE"
@@ -764,6 +869,8 @@ async def handle_text(client, message):
                 pass
             await show_site_panel(client, user_id, site, override_html=text)
             return
+        else:
+            await message.reply("⚠️ এটা HTML কোড মনে হচ্ছে না। সম্পূর্ণ HTML পেস্ট করুন বা `.html` ফাইল পাঠান।")
 
 @bot.on_message(filters.private & filters.document)
 async def handle_document(client, message):
@@ -855,6 +962,44 @@ def build_caption(title, a_idx, total_albums, part, multi_part, hashtag):
     rest = tag_html if REST_CAPTION_HASHTAG else ""
     return first, rest, tag_html
 
+async def _send_via_telethon(tclient, files, paths, first_cap, rest_cap):
+    if len(paths) == 1:
+        await tclient.send_file(
+            STORAGE_CHANNEL_ID, paths[0],
+            caption=first_cap or None, parse_mode="html",
+            supports_streaming=(files[0]["kind"] == "video")
+        )
+    else:
+        caps = [first_cap] + [rest_cap] * (len(paths) - 1)
+        await tclient.send_file(
+            STORAGE_CHANNEL_ID, paths,
+            caption=caps, parse_mode="html",
+            supports_streaming=True
+        )
+
+async def _send_via_pyrogram(pc, files, first_cap, rest_cap):
+    if len(files) == 1:
+        f = files[0]
+        if f["kind"] == "video":
+            await pc.send_video(
+                STORAGE_CHANNEL_ID, video=f["path"], caption=first_cap,
+                parse_mode=enums.ParseMode.HTML, supports_streaming=True
+            )
+        else:
+            await pc.send_photo(
+                STORAGE_CHANNEL_ID, photo=f["path"], caption=first_cap,
+                parse_mode=enums.ParseMode.HTML
+            )
+    else:
+        media = []
+        for i, f in enumerate(files):
+            cap = first_cap if i == 0 else rest_cap
+            if f["kind"] == "video":
+                media.append(InputMediaVideo(f["path"], caption=cap, parse_mode=enums.ParseMode.HTML, supports_streaming=True))
+            else:
+                media.append(InputMediaPhoto(f["path"], caption=cap, parse_mode=enums.ParseMode.HTML))
+        await pc.send_media_group(STORAGE_CHANNEL_ID, media)
+
 async def send_album(files, caption, uploader=None):
     first_cap, rest_cap = caption[0], caption[1]
     tclient = None
@@ -865,46 +1010,25 @@ async def send_album(files, caption, uploader=None):
     elif uploader is None:
         t_ok, _ = await ensure_telethon_connected()
         if t_ok:
-            tclient = telethon_client
+            tclient = get_telethon()
     paths = [f["path"] for f in files]
     pc = uploader["client"] if (uploader and uploader.get("type") == "pyrogram") else bot
 
     if tclient is not None:
-        if len(paths) == 1:
-            await tclient.send_file(
-                STORAGE_CHANNEL_ID, paths[0],
-                caption=first_cap or None, parse_mode="html",
-                supports_streaming=(files[0]["kind"] == "video")
-            )
-        else:
-            caps = [first_cap] + [rest_cap] * (len(paths) - 1)
-            await tclient.send_file(
-                STORAGE_CHANNEL_ID, paths,
-                caption=caps, parse_mode="html",
-                supports_streaming=True
-            )
-    else:
-        if len(files) == 1:
-            f = files[0]
-            if f["kind"] == "video":
-                await pc.send_video(
-                    STORAGE_CHANNEL_ID, video=f["path"], caption=first_cap,
-                    parse_mode=enums.ParseMode.HTML, supports_streaming=True
-                )
-            else:
-                await pc.send_photo(
-                    STORAGE_CHANNEL_ID, photo=f["path"], caption=first_cap,
-                    parse_mode=enums.ParseMode.HTML
-                )
-        else:
-            media = []
-            for i, f in enumerate(files):
-                cap = first_cap if i == 0 else rest_cap
-                if f["kind"] == "video":
-                    media.append(InputMediaVideo(f["path"], caption=cap, parse_mode=enums.ParseMode.HTML, supports_streaming=True))
-                else:
-                    media.append(InputMediaPhoto(f["path"], caption=cap, parse_mode=enums.ParseMode.HTML))
-            await pc.send_media_group(STORAGE_CHANNEL_ID, media)
+        try:
+            await _send_via_telethon(tclient, files, paths, first_cap, rest_cap)
+            return
+        except AuthKeyDuplicatedError:
+            # সেশন স্থায়ীভাবে অকেজো - মার্ক করে বট টোকেন দিয়ে পাঠাই
+            mark_telethon_dead(tclient, "AuthKeyDuplicatedError: একই session দুই IP-তে ব্যবহার হয়েছে।")
+            try:
+                await tclient.disconnect()
+            except Exception:
+                pass
+            print("↩️ Telethon অকেজো, Bot Token দিয়ে আপলোড করা হচ্ছে...")
+            pc = bot
+
+    await _send_via_pyrogram(pc, files, first_cap, rest_cap)
 
 async def send_with_flood_retry(files, caption, state, uploader=None):
     for _ in range(3):
@@ -969,10 +1093,14 @@ def tally(ok_files, failed, a_idx):
 async def send_channel_text(text_html):
     try:
         t_ok, _ = await ensure_telethon_connected()
-        if t_ok:
-            await telethon_client.send_message(STORAGE_CHANNEL_ID, text_html, parse_mode="html")
-        else:
-            await bot.send_message(STORAGE_CHANNEL_ID, text_html, parse_mode=enums.ParseMode.HTML)
+        tc = get_telethon()
+        if t_ok and tc is not None:
+            try:
+                await tc.send_message(STORAGE_CHANNEL_ID, text_html, parse_mode="html")
+                return
+            except AuthKeyDuplicatedError:
+                mark_telethon_dead(tc, "AuthKeyDuplicatedError")
+        await bot.send_message(STORAGE_CHANNEL_ID, text_html, parse_mode=enums.ParseMode.HTML)
     except Exception as e:
         print(f"⚠️ Could not send album report: {e}")
 
@@ -1002,11 +1130,16 @@ async def build_uploaders():
             seen_ids.add(uid)
         uploaders.append({"type": "pyrogram", "client": c, "name": name})
     for i, c in enumerate(telethon_clients, start=1):
+        if id(c) in dead_telethon:
+            continue
         ok, _ = await ensure_telethon_connected(c)
         if not ok:
             continue
         try:
             uid = (await c.get_me()).id
+        except AuthKeyDuplicatedError:
+            mark_telethon_dead(c, "AuthKeyDuplicatedError")
+            continue
         except Exception:
             uid = None
         if uid is not None:
@@ -1073,7 +1206,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         await update_panel(client, user_id, f"🔍 **Running parser `{site['path']}`...**", cancel_kb)
         title, albums = get_site_albums(site, override_html)
 
-        # ========== শুধুমাত্র নতুন ২০টা অ্যালবাম ফিল্টার ==========
+        # ========== শুধুমাত্র নতুন অ্যালবাম ফিল্টার ==========
         new_albums = []
         for album in albums:
             items = album.get("items") or []
@@ -1086,7 +1219,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             if is_album_processed(akey):
                 continue
 
-            # সব মিডিয়া আগে থেকেই আপলোড আছে কিনা
+            # সব মিডিয়া আগে থেকেই আপলোড আছে কিনা
             if all(is_duplicate(url) for _, url in items):
                 mark_album_processed(akey, site_key, album.get("title"))
                 continue
@@ -1103,8 +1236,8 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                 client, user_id,
                 f"✅ **কোনো নতুন অ্যালবাম নেই**\n\n"
                 f"• সাইট: `{safe(site['name'])}`\n"
-                f"• সব অ্যালবাম আগেই স্ক্যান করা হয়েছে অথবা স্টোরেজ চ্যানেলে আছে।\n"
-                f"• নতুন HTML দিয়ে আবার চেষ্টা করুন।",
+                f"• সব অ্যালবাম আগেই স্ক্যান করা হয়েছে অথবা স্টোরেজ চ্যানেলে আছে।\n"
+                f"• নতুন HTML দিয়ে আবার চেষ্টা করুন।",
                 end_kb
             )
             return
@@ -1270,13 +1403,15 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                 f"📦 Total files in album: {len(all_items)}"
             )
             if a_fail:
-                report += f"\n⚠️ Failed: {a_fail}"
+                report += f"\n⚠️ Failed: {a_fail}\n🔁 ব্যর্থ ফাইল পরের স্ক্যানে আবার চেষ্টা হবে"
             await send_channel_text(report)
 
-            # অ্যালবাম প্রসেসড হিসেবে মার্ক
-            first_url = all_items[0][1] if all_items else ""
-            akey = make_album_key(site_key, album.get("title"), first_url)
-            mark_album_processed(akey, site_key, album.get("title"))
+            # শুধু সম্পূর্ণ সফল হলে অ্যালবাম "প্রসেসড" মার্ক হবে
+            # (ফেইল হলে পরের স্ক্যানে আবার চেষ্টা হবে, আপলোড হওয়া ফাইল ডুপ্লিকেট হিসেবে স্কিপ হবে)
+            if a_fail == 0:
+                first_url = all_items[0][1] if all_items else ""
+                akey = make_album_key(site_key, album.get("title"), first_url)
+                mark_album_processed(akey, site_key, album.get("title"))
 
             albums_done += 1
             ws.update({"a_idx": 0, "action": "✅ Idle", "bytes": {}})
@@ -1336,6 +1471,11 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                 pass
         if active_scans.get(user_id) is state:
             active_scans.pop(user_id, None)
+        # স্ক্যান শেষ: Telethon কানেকশন বন্ধ
+        try:
+            await release_telethon()
+        except Exception:
+            pass
 
     if fatal:
         return
@@ -1353,15 +1493,18 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         f"⏭️ **Skipped (duplicate):** `{skipped}`\n"
         f"❌ **Total Failed:** `{len(errors)}`\n"
     )
+    dead_note = [reason for reason in dead_telethon.values()]
+    if dead_note:
+        summary_text += f"\n🔴 **Telethon session অকেজো:** `{safe(dead_note[0])[:150]}`\n"
     if errors:
         joined_errors = "\n".join(errors[:8])
         if len(errors) > 8:
             joined_errors += f"\n...and {len(errors) - 8} more errors."
         summary_text += f"\n\n⚠️ **DETAILED ERROR LOG:**\n```text\n{joined_errors}\n```"
 
-    await update_panel(client, user_id, summary_text, end_kb)
+    await update_panel(client, user_id, summary_text[:4000], end_kb)
 
-# ================= Render Web Service Port Binding =================
+# ================= Web Service Port Binding (Railway/Render) =================
 web_app = Flask(__name__)
 
 @web_app.route("/")
@@ -1380,6 +1523,8 @@ async def main():
     except Exception as e:
         status = f"Restore error: {e}"
     print(f"💾 {status}")
+    # রিস্টোরের জন্য Telethon খুললে সেটা বন্ধ করে দিই (শুধু দরকারে কানেক্ট হবে)
+    await release_telethon()
 
     for i, pc in enumerate(pyro_clients, start=1):
         try:
@@ -1407,6 +1552,12 @@ async def main():
     worker.cancel()
     if backup_dirty:
         await do_backup()
+    for c in telethon_clients:
+        try:
+            if c.is_connected():
+                await c.disconnect()
+        except Exception:
+            pass
     for _n, pc in pyro_ready:
         try:
             await pc.stop()
