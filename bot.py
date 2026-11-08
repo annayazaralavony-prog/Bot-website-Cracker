@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import glob
+import shutil
 import time
 import sqlite3
 import asyncio
@@ -101,8 +102,12 @@ def _collect_pyro_sessions():
 
 DOWNLOAD_PARALLEL = max(1, int(os.environ.get("DOWNLOAD_PARALLEL", "5")))
 SITES_DIR = "sites"
-DB_PATH = "scraped_data.db"
-BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID") or -1004448646419)
+DB_PATH = os.environ.get("DB_PATH", "scraped_data.db")   # Railway Volume থাকলে যেমন /data/scraped_data.db
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir:
+    os.makedirs(_db_dir, exist_ok=True)
+# BACKUP_CHANNEL_ID না দিলে স্টোরেজ চ্যানেলেই ব্যাকআপ যাবে (বট ওখানে অ্যাডমিন আছে)
+BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID") or STORAGE_CHANNEL_ID)
 BACKUP_TAG = "#DB_BACKUP"
 SITE_PREFIX = "🌐 "
 
@@ -113,7 +118,10 @@ MAX_BATCH_BYTES = int(os.environ.get("MAX_BATCH_MB", "2000")) * 1024 * 1024
 # ========== নতুন সেটিংস ==========
 MAX_ALBUMS_PER_SCAN = 20          # প্রতি স্ক্যানে সর্বোচ্চ কয়টা অ্যালবাম
 DEFAULT_HASHTAG = "#newweb"       # ডিফল্ট হ্যাশট্যাগ
-REST_CAPTION_HASHTAG = os.environ.get("REST_CAPTION_HASHTAG", "1") == "1"
+# অ্যালবামে শুধু প্রথম ফাইলে ক্যাপশন (টাইটেল + নিচে হ্যাশট্যাগ) থাকবে, যাতে টেলিগ্রাম অ্যালবামের নিচে ক্যাপশন দেখায়
+REST_CAPTION_HASHTAG = os.environ.get("REST_CAPTION_HASHTAG", "0") == "1"
+# প্রতি অ্যালবাম শেষে চ্যানেলে আলাদা "completed" রিপোর্ট মেসেজ (ডিফল্ট বন্ধ)
+ALBUM_REPORT_IN_CHANNEL = os.environ.get("ALBUM_REPORT_IN_CHANNEL", "0") == "1"
 ORDERED_ALBUMS = os.environ.get("ORDERED_ALBUMS", "1") == "1"
 RESOLVE_PARALLEL = max(1, int(os.environ.get("RESOLVE_PARALLEL", "3")))   # একসাথে কয়টা অ্যালবামের পেজ খুলবে
 
@@ -213,6 +221,7 @@ init_db()
 backup_event = None
 backup_dirty = False
 last_backup_msg_id = None
+startup_db_status = "n/a"
 
 def schedule_backup():
     global backup_dirty
@@ -331,7 +340,7 @@ async def restore_db_from_telegram():
         return "Backup file invalid - ignored."
 
     conn.close()
-    os.replace(path, DB_PATH)
+    shutil.move(path, DB_PATH)
     init_db()
     last_backup_msg_id = msg_id
     cursor.execute("SELECT COUNT(*) FROM uploaded_media")
@@ -671,23 +680,40 @@ def albums_panel_text(albums):
 async def show_site_panel(client, user_id, site, override_html=None):
     discover_sites()
     site = loaded_sites.get(site["key"], site)
+    auto_html = False
+    fetch_err_txt = ""
     if override_html is None:
-        override_html = db_get_site_html(site["key"])
+        fetch_fn = getattr(site["module"], "fetch_html_content", None)
+        if fetch_fn:
+            try:
+                fetched = await fetch_fn()
+                if fetched and fetched.strip():
+                    override_html = fetched
+                    auto_html = True
+            except Exception as fe:
+                fetch_err_txt = f"\n⚠️ **Auto-fetch Error:** `{safe(fe)[:150]}`\n"
+        if override_html is None:
+            override_html = db_get_site_html(site["key"])
     try:
         _title, albums = get_site_albums(site, override_html)
-        err_txt = ""
+        err_txt = fetch_err_txt
     except Exception as e:
         albums = []
-        err_txt = f"\n⚠️ **Parser Error:** `{safe(e)}`\n"
+        err_txt = fetch_err_txt + f"\n⚠️ **Parser Error:** `{safe(e)}`\n"
 
     sess = user_sessions.setdefault(user_id, {})
     sess["state"] = "IDLE"
     sess["active_site_key"] = site["key"]
-    if override_html is not None:
+    if override_html is not None and not auto_html:
         sess.setdefault("custom_html", {})[site["key"]] = override_html
 
     has_html = override_html is not None or bool(getattr(site["module"], "HTML_CONTENT", "").strip())
-    source_note = "📄 **HTML Source:** `Ready in file`" if has_html else "⚠️ **HTML Source:** `Empty (Send .html file or paste code)`"
+    if auto_html:
+        source_note = "📄 **HTML Source:** `Auto-fetch from website`"
+    elif has_html:
+        source_note = "📄 **HTML Source:** `Saved / Ready in file`"
+    else:
+        source_note = "⚠️ **HTML Source:** `Empty (Set SITE_LIST_URLS or send .html file)`"
 
     await reset_panel(client, user_id)
     await update_panel(
@@ -739,7 +765,9 @@ async def start_cmd(client, message):
         f"⚡ **Telethon Engine:** `{engine_status}`\n"
         f"📦 **Storage Channel:** `{STORAGE_CHANNEL_ID}`\n"
         f"📌 **Albums per Scan:** `{MAX_ALBUMS_PER_SCAN}`\n"
-        f"🏷️ **Default Hashtag:** `{DEFAULT_HASHTAG}`\n\n"
+        f"🏷️ **Default Hashtag:** `{DEFAULT_HASHTAG}`\n"
+        f"💾 **Database:** `{safe(startup_db_status)[:120]}`\n"
+        f"🗄️ **DB Path:** `{DB_PATH}`\n\n"
         f"📂 **Loaded Website Modules ({len(loaded_sites)}):**\n{sites_list}\n\n"
         "নিচের মেনু কিবোর্ড থেকে যেকোনো ওয়েবসাইট সিলেক্ট করে স্ক্যান শুরু করুন:"
     )
@@ -981,7 +1009,7 @@ def build_caption(title, a_idx, total_albums, part, multi_part, hashtag):
     tag_html = htmllib.escape(single_tag)
     clean_title = re.sub(r"#\S+", "", title or "").strip()
     if clean_title:
-        first = f"<b>{htmllib.escape(clean_title[:200])}</b>\n{tag_html}"
+        first = f"<b>{htmllib.escape(clean_title[:200])}</b>\n\n{tag_html}"
     else:
         first = tag_html
     rest = tag_html if REST_CAPTION_HASHTAG else ""
@@ -1087,9 +1115,10 @@ async def send_batch(files, caption, state, uploader=None):
 
         tag_only = caption[2]
         ok_files, failed = [], []
-        for f in files:
+        for fi, f in enumerate(files):
             try:
-                await send_with_flood_retry([f], (tag_only, tag_only, tag_only), state, uploader)
+                single_cap = caption if fi == 0 else (tag_only, tag_only, tag_only)
+                await send_with_flood_retry([f], single_cap, state, uploader)
                 ok_files.append(f)
             except ScanCancelled:
                 raise
@@ -1228,6 +1257,28 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             pass
 
     try:
+        # ========== লিস্ট পেজ নিজে থেকে সাইট থেকে আনা (SITE_LIST_URLS সেট থাকলে) ==========
+        fetch_fn = getattr(site_mod, "fetch_html_content", None)
+        if fetch_fn:
+            await update_panel(client, user_id, "🌐 **সাইট থেকে লিস্ট পেজ আনা হচ্ছে...**", cancel_kb)
+            fetch_err = None
+            try:
+                fetched = await fetch_fn()
+                if fetched and fetched.strip():
+                    override_html = fetched
+            except Exception as fe:
+                fetch_err = f"{type(fe).__name__}: {fe}"
+                print(f"⚠️ Auto-fetch failed: {fetch_err}")
+            have_fallback = bool((override_html or "").strip()) or bool(str(getattr(site_mod, "HTML_CONTENT", "")).strip())
+            if fetch_err and not have_fallback:
+                await update_panel(
+                    client, user_id,
+                    f"❌ **লিস্ট পেজ আনা যায়নি**\n\n`{safe(fetch_err)[:300]}`\n\n"
+                    f"কুকি/লিংক চেক করুন অথবা HTML ফাইল পাঠান।",
+                    end_kb
+                )
+                return
+
         await update_panel(client, user_id, f"🔍 **Running parser `{site['path']}`...**", cancel_kb)
         title, albums = get_site_albums(site, override_html)
 
@@ -1505,7 +1556,8 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             )
             if a_fail:
                 report += f"\n⚠️ Failed: {a_fail}\n🔁 ব্যর্থ ফাইল পরের স্ক্যানে আবার চেষ্টা হবে"
-            await send_channel_text(report)
+            if ALBUM_REPORT_IN_CHANNEL:
+                await send_channel_text(report)
 
             # শুধু সম্পূর্ণ সফল হলে অ্যালবাম "প্রসেসড" মার্ক হবে
             # (ফেইল হলে পরের স্ক্যানে আবার চেষ্টা হবে, আপলোড হওয়া ফাইল ডুপ্লিকেট হিসেবে স্কিপ হবে)
@@ -1616,12 +1668,13 @@ def run_flask():
     web_app.run(host="0.0.0.0", port=port)
 
 async def main():
-    global backup_event
+    global backup_event, startup_db_status
     await bot.start()
     try:
         status = await restore_db_from_telegram()
     except Exception as e:
         status = f"Restore error: {e}"
+    startup_db_status = status
     print(f"💾 {status}")
     # রিস্টোরের জন্য Telethon খুললে সেটা বন্ধ করে দিই (শুধু দরকারে কানেক্ট হবে)
     await release_telethon()
