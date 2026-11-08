@@ -11,7 +11,7 @@ import aiohttp
 import traceback
 import importlib.util
 import html as htmllib
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from datetime import datetime, timezone
 from threading import Thread
 from flask import Flask
@@ -124,6 +124,9 @@ REST_CAPTION_HASHTAG = os.environ.get("REST_CAPTION_HASHTAG", "0") == "1"
 ALBUM_REPORT_IN_CHANNEL = os.environ.get("ALBUM_REPORT_IN_CHANNEL", "0") == "1"
 ORDERED_ALBUMS = os.environ.get("ORDERED_ALBUMS", "1") == "1"
 RESOLVE_PARALLEL = max(1, int(os.environ.get("RESOLVE_PARALLEL", "3")))   # একসাথে কয়টা অ্যালবামের পেজ খুলবে
+
+# ========== Send Link ফিচারের সেটিংস ==========
+MAX_LINKS_QUEUE = 10              # একসাথে সর্বোচ্চ কয়টা লিংক কিউতে থাকতে পারবে (অ্যালবামের ফাইল সংখ্যার কোনো লিমিট নেই)
 
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -470,6 +473,14 @@ discover_sites()
 # ================= ইউজার সেশন ও বাটন =================
 user_sessions = {}
 active_scans = {}
+link_jobs = {}          # user_id -> Send Link কিউ জব
+
+def link_job_running(user_id):
+    job = link_jobs.get(user_id)
+    return bool(job and not job.get("closed"))
+
+def any_link_running():
+    return any(link_job_running(u) for u in list(link_jobs))
 
 class ScanCancelled(Exception):
     pass
@@ -497,6 +508,7 @@ def get_home_keyboard():
 def get_site_keyboard(site_key):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 Start Scan & Upload", callback_data=f"site_scan_{site_key}")],
+        [InlineKeyboardButton("🔗 Send Link", callback_data=f"site_link_{site_key}")],
         [InlineKeyboardButton("📄 Send New HTML for this Site", callback_data=f"site_html_{site_key}")],
         [InlineKeyboardButton("🏠 Home", callback_data="menu_home")]
     ])
@@ -504,6 +516,11 @@ def get_site_keyboard(site_key):
 def get_cancel_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⛔ Cancel Scan", callback_data="action_cancel_scan")]
+    ])
+
+def get_link_cancel_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⛔ Cancel Links", callback_data="action_cancel_links")]
     ])
 
 def build_sites_reply_keyboard():
@@ -627,8 +644,8 @@ async def ensure_telethon_connected(tclient=None):
             return False, f"{type(e).__name__}: {str(e)}"
 
 async def release_telethon():
-    """স্ক্যান না চললে Telethon কানেকশন বন্ধ রাখি (Railway overlap-এ সেশন ক্লাশ কমাতে)"""
-    if active_scans:
+    """স্ক্যান/লিংক কিউ না চললে Telethon কানেকশন বন্ধ রাখি (Railway overlap-এ সেশন ক্লাশ কমাতে)"""
+    if active_scans or any_link_running():
         return
     for c in telethon_clients:
         try:
@@ -725,7 +742,7 @@ async def show_site_panel(client, user_id, site, override_html=None):
         f"{albums_panel_text(albums)}"
         f"{err_txt}\n"
         f"প্রতি স্ক্যানে সর্বোচ্চ **{MAX_ALBUMS_PER_SCAN}**টি নতুন অ্যালবাম প্রসেস হবে।\n"
-        f"স্ক্যান শুরু করতে বা নতুন HTML ফাইল দিতে নিচের বাটনে ক্লিক করুন:",
+        f"স্ক্যান শুরু করতে, অ্যালবামের লিংক পাঠাতে বা নতুন HTML ফাইল দিতে নিচের বাটনে ক্লিক করুন:",
         get_site_keyboard(site["key"])
     )
 
@@ -851,6 +868,14 @@ async def handle_callbacks(client, cq):
             else:
                 await safe_answer(cq, "No active scan.")
 
+        elif data == "action_cancel_links":
+            job = link_jobs.get(user_id)
+            if job and not job.get("closed"):
+                job["state"]["cancel"] = True
+                await safe_answer(cq, "Cancelling link queue...")
+            else:
+                await safe_answer(cq, "No active link queue.")
+
         elif data.startswith("site_scan_"):
             site_key = data.replace("site_scan_", "", 1)
             site = loaded_sites.get(site_key)
@@ -861,7 +886,41 @@ async def handle_callbacks(client, cq):
             override = sess.get("custom_html", {}).get(site_key) or db_get_site_html(site_key)
             started = await start_scan(client, user_id, site, override)
             if not started:
-                await update_panel(client, user_id, "⚠️ একটি স্ক্যান ইতিমধ্যে চলছে। আগে সেটা শেষ করুন অথবা ক্যানসেল করুন।", get_site_keyboard(site_key))
+                await update_panel(client, user_id, "⚠️ একটি স্ক্যান বা লিংক কিউ ইতিমধ্যে চলছে। আগে সেটা শেষ করুন অথবা ক্যানসেল করুন।", get_site_keyboard(site_key))
+
+        elif data.startswith("site_link_"):
+            site_key = data.replace("site_link_", "", 1)
+            site = loaded_sites.get(site_key)
+            if not site:
+                await safe_answer(cq, "Site not found!")
+                return
+            if not hasattr(site["module"], "resolve_album"):
+                await safe_answer(cq, "এই সাইট ফাইলে resolve_album() নেই!")
+                return
+            old_scan = active_scans.get(user_id)
+            if old_scan and not old_scan["task"].done():
+                await safe_answer(cq, "স্ক্যান চলছে, আগে শেষ করুন বা ক্যানসেল করুন।")
+                return
+
+            sess["state"] = "WAITING_LINK"
+            sess["active_site_key"] = site_key
+            await safe_answer(cq)
+
+            if link_job_running(user_id):
+                await refresh_link_panel(client, user_id, link_jobs[user_id], force=True)
+                return
+
+            await update_panel(
+                client, user_id,
+                f"🔗 **{safe(site['name'])}** — Send Link\n\n"
+                f"• অ্যালবামের লিংক পাঠান (একসাথে একাধিক লিংকও পাঠানো যায়)\n"
+                f"• সর্বোচ্চ **{MAX_LINKS_QUEUE}**টা লিংক একসাথে কিউতে থাকতে পারবে\n"
+                f"• একটা শেষ হলে বট পরেরটা ধরবে\n"
+                f"• অ্যালবামের সব ফটো/ভিডিও ক্যাপশন + `{DEFAULT_HASHTAG}` সহ স্টোরেজ চ্যানেলে যাবে\n"
+                f"• অ্যালবাম শেষ হলে চ্যানেলে কমপ্লিট মেসেজ যাবে\n\n"
+                f"এখন লিংক পাঠান 👇",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]])
+            )
 
         elif data.startswith("site_html_"):
             site_key = data.replace("site_html_", "", 1)
@@ -903,6 +962,38 @@ async def handle_text(client, message):
         if site:
             await show_site_panel(client, user_id, site)
             return
+
+    # লিংক পাঠানো হলে (Send Link ফিচার)
+    if sess.get("state") == "WAITING_LINK":
+        site_key = sess.get("active_site_key")
+        site = loaded_sites.get(site_key)
+        links = extract_links(text)
+        if not site:
+            await message.reply("⚠️ সাইট পাওয়া যায়নি। /start দিয়ে আবার শুরু করুন।")
+            return
+        if not links:
+            await message.reply("⚠️ কোনো বৈধ লিংক পাওয়া যায়নি। অ্যালবামের লিংক (https://...) পাঠান।")
+            return
+
+        result = await enqueue_links(client, user_id, site, links)
+        status = result["status"]
+        if status == "scan_running":
+            await message.reply("⚠️ একটি স্ক্যান চলছে। আগে সেটা শেষ করুন অথবা ক্যানসেল করুন।")
+            return
+        if status == "cancelling":
+            await message.reply("⚠️ লিংক কিউ বন্ধ হচ্ছে, একটু পরে আবার লিংক পাঠান।")
+            return
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        job = result["job"]
+        if not result["new_job"]:
+            # চলমান জবে লিংক যোগ হয়েছে (বা বাদ পড়েছে) - প্যানেল রিফ্রেশ
+            await refresh_link_panel(client, user_id, job, force=True)
+        return
 
     # HTML পেস্ট করা হলে
     if sess.get("state") == "WAITING_HTML":
@@ -1161,6 +1252,8 @@ async def send_channel_text(text_html):
 async def start_scan(client, user_id, site, override_html=None):
     old = active_scans.get(user_id)
     if old and not old["task"].done():
+        return False
+    if link_job_running(user_id):
         return False
     if override_html is None:
         override_html = db_get_site_html(site["key"])
@@ -1656,6 +1749,448 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
 
     await update_panel(client, user_id, summary_text[:4000], end_kb)
 
+# ================= 🔗 SEND LINK ফিচার =================
+# ইউজার অ্যালবামের লিংক পাঠায় → বট সেই অ্যালবামের সব ফটো/ভিডিও স্টোরেজ চ্যানেলে আপলোড করে
+# (ক্যাপশন + নিচে #newweb) → শেষে চ্যানেলে "Album completed" মেসেজ।
+# একসাথে সর্বোচ্চ MAX_LINKS_QUEUE টা লিংক কিউতে থাকে; একটা শেষ হলে পরেরটা শুরু হয়।
+# অ্যালবামের ফাইল সংখ্যার কোনো লিমিট নেই।
+
+def extract_links(text):
+    found = []
+    for m in re.findall(r'https?://[^\s<>"\']+', text or ""):
+        u = m.rstrip(".,;:!?)]}>»")
+        if u and u not in found:
+            found.append(u)
+    return found
+
+def title_from_url(url):
+    path = urlparse(url).path.strip("/")
+    seg = path.split("/")[-1] if path else ""
+    seg = re.sub(r"\.\w{2,4}$", "", seg)
+    t = re.sub(r"[-_]+", " ", unquote(seg)).strip()
+    return t[:120] or "Album"
+
+async def fetch_link_title(site_mod, url):
+    """অ্যালবামের পেজ থেকে টাইটেল আনে (সাইট মডিউলে fetch_album_title(url) থাকলে সেটাই ব্যবহার হবে)"""
+    fn = getattr(site_mod, "fetch_album_title", None)
+    if fn:
+        try:
+            t = await fn(url)
+            if t:
+                return str(t).strip()[:180]
+        except Exception:
+            pass
+
+    fetch_html = getattr(site_mod, "_fetch_html", None)
+    if fetch_html is None:
+        return None
+    try:
+        from curl_cffi.requests import AsyncSession
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return None
+    try:
+        async with AsyncSession(impersonate="chrome") as s:
+            html_text = await fetch_html(s, url, getattr(site_mod, "BASE_URL", None))
+        soup = BeautifulSoup(html_text, "html.parser")
+        cands = []
+        og = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
+        if og and og.get("content"):
+            cands.append(og["content"])
+        h1 = soup.find("h1")
+        if h1:
+            cands.append(h1.get_text(" ", strip=True))
+        if soup.title and soup.title.string:
+            cands.append(soup.title.string)
+        for c in cands:
+            t = re.sub(r"#\S+", "", htmllib.unescape(str(c)))
+            t = re.sub(r"\s+", " ", t).strip()
+            if len(t) >= 3:
+                return t[:180]
+    except Exception:
+        return None
+    return None
+
+def link_panel_text(job):
+    cur = job.get("current")
+    pending = job["queue"]
+    used = len(pending) + (1 if cur else 0)
+    free_slots = max(0, MAX_LINKS_QUEUE - used)
+    lines = [
+        f"🔗 **Link Queue** — `{safe(job['site_name'])}`",
+        f"⚡ **Engine:** `{safe(job.get('engine') or '...')}`",
+        f"🏷️ **Hashtag:** `{DEFAULT_HASHTAG}`",
+        "",
+    ]
+    if cur:
+        mb = job.get("mb", 0)
+        mb_txt = f" | 📦 `{mb} MB`" if mb else ""
+        shown = safe(cur.get("title") or cur["url"])[:40]
+        lines.append(f"▶️ **চলছে:** `{cur['seq']}/{job['total']}` `{shown}`")
+        lines.append(f"   {job.get('action', '')}{mb_txt}")
+    if pending:
+        lines.append(f"⏳ **অপেক্ষায়:** `{len(pending)}`টি লিংক")
+        for i, u in enumerate(pending[:5], start=1):
+            lines.append(f"   {i}. `{safe(u)[:45]}`")
+        if len(pending) > 5:
+            lines.append(f"   ...আরও {len(pending) - 5}টি")
+    lines.append("")
+    lines.append(
+        f"✅ **Done:** `{job['ok']}` | ❌ **Failed:** `{job['failed']}` | "
+        f"🎬 `{job['up_v']}` | 🖼️ `{job['up_p']}`"
+    )
+    if job.get("note"):
+        lines.append(job["note"])
+    lines.append(f"\n➕ আরও `{free_slots}`টি লিংক পাঠাতে পারবেন।")
+    return "\n".join(lines)
+
+async def refresh_link_panel(client, user_id, job, force=False):
+    now = time.monotonic()
+    if not force and now - job.get("last_panel", 0.0) < 3:
+        return
+    job["last_panel"] = now
+    try:
+        await update_panel(client, user_id, link_panel_text(job), get_link_cancel_keyboard())
+    except Exception:
+        pass
+
+async def enqueue_links(client, user_id, site, links):
+    """লিংকগুলো কিউতে যোগ করে; জব না চললে নতুন জব শুরু করে"""
+    old_scan = active_scans.get(user_id)
+    if old_scan and not old_scan["task"].done():
+        return {"status": "scan_running"}
+
+    job = link_jobs.get(user_id)
+    new_job = False
+    if job and not job.get("closed"):
+        if job["state"].get("cancel"):
+            return {"status": "cancelling"}
+    else:
+        job = {
+            "queue": [], "state": {"cancel": False}, "site_key": site["key"], "site_name": site["name"],
+            "current": None, "done": 0, "total": 0, "ok": 0, "failed": 0, "up_v": 0, "up_p": 0,
+            "results": [], "note": "", "closed": False, "engine": "", "action": "",
+            "mb": 0, "last_panel": 0.0, "task": None, "site": site,
+        }
+        link_jobs[user_id] = job
+        new_job = True
+
+    added = dup = rejected = 0
+    for l in links:
+        used = len(job["queue"]) + (1 if job["current"] else 0)
+        if l in job["queue"] or (job["current"] and job["current"]["url"] == l):
+            dup += 1
+            continue
+        if used >= MAX_LINKS_QUEUE:
+            rejected += 1
+            continue
+        job["queue"].append(l)
+        job["total"] += 1
+        added += 1
+
+    notes = []
+    if rejected:
+        notes.append(f"⚠️ কিউ পূর্ণ (সর্বোচ্চ {MAX_LINKS_QUEUE}টি): `{rejected}`টি লিংক বাদ পড়েছে")
+    if dup:
+        notes.append(f"ℹ️ `{dup}`টি লিংক আগে থেকেই কিউতে আছে")
+    job["note"] = "\n".join(notes)
+
+    if new_job:
+        job["task"] = asyncio.create_task(process_link_queue(client, user_id, job))
+
+    return {"status": "ok", "job": job, "new_job": new_job, "added": added, "dup": dup, "rejected": rejected}
+
+async def process_one_link(client, user_id, job, uploader, url, seq):
+    state = job["state"]
+    site = job["site"]
+    site_key = site["key"]
+    site_mod = site["module"]
+    hashtag = DEFAULT_HASHTAG
+
+    resolve_fn = getattr(site_mod, "resolve_album", None)
+    if resolve_fn is None:
+        raise RuntimeError("এই সাইট ফাইলে resolve_album() নেই")
+
+    job["action"] = "🔎 অ্যালবামের পেজ খোলা হচ্ছে..."
+    job["mb"] = 0
+    await refresh_link_panel(client, user_id, job, force=True)
+
+    title = await fetch_link_title(site_mod, url) or title_from_url(url)
+    check_cancel(state)
+    job["current"]["title"] = title
+
+    album = {"title": title, "items": [], "url": url, "needs_resolve": True}
+    try:
+        res_items = await resolve_fn(album, state)
+    except Exception:
+        if album.get("debug_html"):
+            try:
+                bio = io.BytesIO(album["debug_html"].encode("utf-8", "ignore"))
+                bio.name = "album_page_debug.html"
+                await client.send_document(
+                    user_id, bio,
+                    caption=f"🐞 Debug: এই পেজ থেকে ফটো/ভিডিও পাওয়া যায়নি\n{url[:200]}"
+                )
+            except Exception as dbg_err:
+                print(f"⚠️ Debug HTML send failed: {dbg_err}")
+        raise
+    check_cancel(state)
+
+    all_items = list(res_items or [])
+    if not all_items:
+        raise RuntimeError("অ্যালবামে কোনো ফটো/ভিডিও পাওয়া যায়নি")
+
+    akey = album_key_of(site_key, album)
+    v_found = sum(1 for k, _ in all_items if k == "video")
+    p_found = len(all_items) - v_found
+
+    items = []
+    prev_v = prev_p = 0
+    seen = set()
+    for kind, u in all_items:
+        if u in seen:
+            continue
+        seen.add(u)
+        if is_duplicate(u):
+            if kind == "video":
+                prev_v += 1
+            else:
+                prev_p += 1
+            continue
+        items.append((kind, u))
+
+    if not items:
+        mark_album_processed(akey, site_key, title)
+        return {"ok": True, "title": title, "v": 0, "p": 0, "fail": 0, "note": "আগেই আপলোড করা আছে"}
+
+    a_up_v = a_up_p = a_fail = 0
+    part = 0
+    sem = asyncio.Semaphore(DOWNLOAD_PARALLEL)
+    bytes_map = {}
+
+    async def dl_one(item_idx, kind, u):
+        label = "Video" if kind == "video" else "Photo"
+        temp = f"tmplink_{user_id}_{seq}_{item_idx}{url_ext(u, kind)}"
+
+        async def progress(downloaded, total):
+            bytes_map[item_idx] = downloaded
+            job["mb"] = sum(bytes_map.values()) // (1024 * 1024)
+            await refresh_link_panel(client, user_id, job)
+
+        async with sem:
+            try:
+                check_cancel(state)
+                ok, err = await download_file_with_details(u, temp, site_mod, state, progress, MAX_FILE_BYTES)
+            except ScanCancelled:
+                return {"cancelled": True, "ok": False}
+        bytes_map.pop(item_idx, None)
+        if not ok:
+            if os.path.exists(temp):
+                os.remove(temp)
+            return {
+                "ok": False,
+                "err": f"• [Link {seq} {label} #{item_idx} Failed]\n  URL: {u[:45]}...\n  Reason: {err}"
+            }
+        size = os.path.getsize(temp)
+        return {"ok": True, "file": {"path": temp, "kind": kind, "url": u, "size": size}}
+
+    try:
+        for start in range(0, len(items), MAX_ALBUM_BATCH):
+            check_cancel(state)
+            chunk = items[start:start + MAX_ALBUM_BATCH]
+            job["action"] = f"⬇️ Downloading `{start + 1}-{start + len(chunk)}/{len(items)}`"
+            await refresh_link_panel(client, user_id, job, force=True)
+
+            results = await asyncio.gather(*[
+                dl_one(start + off + 1, kind, u)
+                for off, (kind, u) in enumerate(chunk)
+            ])
+            if any(r.get("cancelled") for r in results):
+                raise ScanCancelled()
+            check_cancel(state)
+
+            downloaded_files = []
+            for r in results:
+                if r["ok"]:
+                    downloaded_files.append(r["file"])
+                else:
+                    a_fail += 1
+
+            groups, cur, cur_bytes = [], [], 0
+            for f in downloaded_files:
+                if cur and cur_bytes + f["size"] > MAX_BATCH_BYTES:
+                    groups.append(cur)
+                    cur, cur_bytes = [], 0
+                cur.append(f)
+                cur_bytes += f["size"]
+            if cur:
+                groups.append(cur)
+
+            for g in groups:
+                check_cancel(state)
+                part += 1
+                mb = sum(f["size"] for f in g) // (1024 * 1024)
+                job["action"] = f"⬆️ Uploading Part `{part}`: `{len(g)} files, {mb} MB`"
+                job["mb"] = 0
+                bytes_map.clear()
+                await refresh_link_panel(client, user_id, job, force=True)
+                multi = len(items) > MAX_ALBUM_BATCH or part > 1
+                ok_files, failed = await upload_album_batch(
+                    g, title, seq, job["total"], part, multi, hashtag, state, uploader
+                )
+                v, p, errs = tally(ok_files, failed, seq)
+                a_up_v += v
+                a_up_p += p
+                job["up_v"] += v
+                job["up_p"] += p
+                a_fail += len(errs)
+                await cancellable_sleep(1, state)
+    finally:
+        for fn in glob.glob(f"tmplink_{user_id}_{seq}_*"):
+            try:
+                os.remove(fn)
+            except Exception:
+                pass
+
+    # ===== অ্যালবাম কমপ্লিট মেসেজ (স্টোরেজ চ্যানেলে) =====
+    report = (
+        f"✅ <b>Album completed</b>\n"
+        f"📁 {htmllib.escape(title[:200])}\n"
+        f"🎬 Videos: {a_up_v + prev_v}/{v_found}\n"
+        f"🖼️ Photos: {a_up_p + prev_p}/{p_found}\n"
+        f"📦 Total files in album: {len(all_items)}"
+    )
+    if a_fail:
+        report += f"\n⚠️ Failed: {a_fail}\n🔁 ব্যর্থ ফাইল একই লিংক আবার পাঠালে আবার চেষ্টা হবে"
+    await send_channel_text(report)
+
+    if a_fail == 0:
+        mark_album_processed(akey, site_key, title)
+
+    return {"ok": a_fail == 0, "title": title, "v": a_up_v, "p": a_up_p, "fail": a_fail, "note": ""}
+
+async def process_link_queue(client, user_id, job):
+    state = job["state"]
+    site = job["site"]
+    site_key = site["key"]
+    site_mod = site["module"]
+    end_kb = get_site_keyboard(site_key)
+    cancelled = False
+    fatal_text = None
+    dropped = 0
+
+    # অ্যালবামের ফাইল/পেজ সংখ্যার লিমিট তুলে দেওয়া (কাজ শেষে আগের মান ফিরে আসবে)
+    saved_limits = {}
+    for name, val in (("MAX_ITEMS_PER_ALBUM", 1_000_000), ("MAX_DETAIL_PAGES", 1000)):
+        if hasattr(site_mod, name):
+            saved_limits[name] = getattr(site_mod, name)
+            setattr(site_mod, name, val)
+
+    try:
+        job["action"] = "⏳ আপলোডার প্রস্তুত হচ্ছে..."
+        uploaders = await build_uploaders()
+        uploader = uploaders[0]
+        job["engine"] = uploader["name"] if uploader["name"] == "Bot Token" else f"{uploader['name']} (User Session)"
+
+        seq = 0
+        while True:
+            if state.get("cancel"):
+                cancelled = True
+                dropped = len(job["queue"])
+                job["queue"].clear()
+                job["closed"] = True
+                break
+            if not job["queue"]:
+                job["closed"] = True   # await ছাড়াই বন্ধ মার্ক - যাতে নতুন লিংক হারিয়ে না যায়
+                break
+
+            url = job["queue"].pop(0)
+            seq += 1
+            job["current"] = {"url": url, "title": "", "seq": seq}
+            job["action"] = "⏳ শুরু হচ্ছে..."
+            job["mb"] = 0
+            await refresh_link_panel(client, user_id, job, force=True)
+
+            try:
+                res = await process_one_link(client, user_id, job, uploader, url, seq)
+                short = safe(res["title"])[:30]
+                if res["ok"]:
+                    job["ok"] += 1
+                    if res["note"]:
+                        job["results"].append(f"✅ {short} — {res['note']}")
+                    else:
+                        job["results"].append(f"✅ {short} — 🎬{res['v']} 🖼️{res['p']}")
+                else:
+                    job["failed"] += 1
+                    job["results"].append(f"⚠️ {short} — 🎬{res['v']} 🖼️{res['p']} (❌ {res['fail']} failed)")
+            except ScanCancelled:
+                cancelled = True
+                job["current"] = None
+                dropped = len(job["queue"])
+                job["queue"].clear()
+                job["closed"] = True
+                break
+            except Exception as e:
+                job["failed"] += 1
+                job["results"].append(f"❌ {safe(url)[:40]} — {type(e).__name__}: {safe(e)[:120]}")
+
+            job["done"] += 1
+            job["current"] = None
+            await refresh_link_panel(client, user_id, job, force=True)
+
+    except Exception as fatal_e:
+        job["closed"] = True
+        job["queue"].clear()
+        fatal_text = f"{type(fatal_e).__name__}: {safe(fatal_e)}\n{traceback.format_exc()[-800:]}"
+    finally:
+        job["closed"] = True
+        job["current"] = None
+        for name, val in saved_limits.items():
+            try:
+                setattr(site_mod, name, val)
+            except Exception:
+                pass
+        for fn in glob.glob(f"tmplink_{user_id}_*"):
+            try:
+                os.remove(fn)
+            except Exception:
+                pass
+        try:
+            await release_telethon()
+        except Exception:
+            pass
+
+    sess = user_sessions.get(user_id)
+    if sess and sess.get("state") == "WAITING_LINK":
+        sess["state"] = "IDLE"
+
+    if fatal_text:
+        await update_panel(
+            client, user_id,
+            f"🚨 **LINK QUEUE FAILURE**\n```python\n{fatal_text[:1500]}\n```",
+            end_kb
+        )
+        return
+
+    head = "⛔ **LINK QUEUE STOPPED**" if cancelled else "🏁 **LINK QUEUE COMPLETED**"
+    summary = (
+        f"{head}\n\n"
+        f"🌐 **Website:** `{safe(job['site_name'])}`\n"
+        f"🏷️ **Hashtag:** `{DEFAULT_HASHTAG}`\n"
+        f"🔗 **Links Processed:** `{job['done']}/{job['total']}`\n"
+        f"✅ **Successful:** `{job['ok']}` | ❌ **Failed:** `{job['failed']}`\n"
+        f"🎬 **Videos Uploaded:** `{job['up_v']}`\n"
+        f"🖼️ **Photos Uploaded:** `{job['up_p']}`\n"
+    )
+    if dropped:
+        summary += f"🗑️ **বাতিল হওয়া লিংক:** `{dropped}`\n"
+    if job["results"]:
+        shown = "\n".join(job["results"][-8:])
+        if len(job["results"]) > 8:
+            shown = f"...আগের {len(job['results']) - 8}টি বাদ\n" + shown
+        summary += f"\n```text\n{shown}\n```"
+    await update_panel(client, user_id, summary[:4000], end_kb)
+
 # ================= Web Service Port Binding (Railway/Render) =================
 web_app = Flask(__name__)
 
@@ -1698,7 +2233,7 @@ async def main():
     worker = asyncio.create_task(backup_worker())
     print(f"🤖 Bot is running. Loaded {len(loaded_sites)} site modules. "
           f"Pyrogram uploader accounts: {len(pyro_ready)} | Telethon accounts: {len(telethon_clients)}")
-    print(f"📌 MAX_ALBUMS_PER_SCAN = {MAX_ALBUMS_PER_SCAN} | DEFAULT_HASHTAG = {DEFAULT_HASHTAG}")
+    print(f"📌 MAX_ALBUMS_PER_SCAN = {MAX_ALBUMS_PER_SCAN} | DEFAULT_HASHTAG = {DEFAULT_HASHTAG} | MAX_LINKS_QUEUE = {MAX_LINKS_QUEUE}")
 
     await idle()
 
