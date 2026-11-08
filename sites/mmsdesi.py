@@ -710,6 +710,45 @@ async def _fetch_html(session, url, referer=None):
     raise RuntimeError(f"অ্যালবামের পেজ খোলা যায়নি ({last})")
 
 
+# ================= লিস্ট পেজ নিজে থেকে সাইট থেকে আনা (HTML বারবার পাঠানোর ঝামেলা বন্ধ) =================
+# Railway Variables-এ দিন:
+#   SITE_LIST_URLS = https://mmsdesi.me/আপনার-লিস্ট-পেজ/        (কমা দিয়ে একাধিক দেওয়া যায়)
+#   SITE_LIST_PAGES = 3   (ঐচ্ছিক - লিংকে {page} থাকলে ১ থেকে ৩ পর্যন্ত পেজ আনবে, যেমন https://mmsdesi.me/page/{page}/)
+def _list_urls():
+    raw = os.environ.get("SITE_LIST_URLS") or os.environ.get("SITE_LIST_URL") or ""
+    return [u.strip() for u in raw.replace("\n", ",").split(",") if u.strip()]
+
+
+async def fetch_html_content():
+    """
+    SITE_LIST_URLS সেট না থাকলে None ফেরত দেয় (তখন সেভ করা/পেস্ট করা HTML ব্যবহার হবে)।
+    সেট থাকলে লিস্ট পেজ(গুলো) সাইট থেকে এনে একসাথে HTML ফেরত দেয়; ব্যর্থ হলে RuntimeError।
+    """
+    urls = _list_urls()
+    if not urls:
+        return None
+    pages = max(1, int(os.environ.get("SITE_LIST_PAGES", "1")))
+    targets = []
+    for u in urls:
+        if "{page}" in u:
+            for n in range(1, pages + 1):
+                targets.append(u.replace("{page}", str(n)))
+        else:
+            targets.append(u)
+
+    parts, last_err = [], None
+    async with AsyncSession(impersonate="chrome") as session:
+        for t in targets:
+            try:
+                parts.append(await _fetch_html(session, t, BASE_URL))
+            except Exception as e:
+                last_err = e
+            await asyncio.sleep(0.5)
+    if not parts:
+        raise RuntimeError(f"লিস্ট পেজ আনা যায়নি: {last_err}")
+    return "\n".join(parts)
+
+
 async def resolve_album(album, state=None):
     """
     বট স্ক্যানের সময় প্রতিটা অ্যালবামের জন্য এটা কল করে।
