@@ -9,9 +9,10 @@ from curl_cffi.requests import AsyncSession
 
 # ================= ওয়েবসাইট কনফিগারেশন =================
 SITE_NAME = "MMSDesi"
-HASHTAG = "#mmsdesi"  # ক্যাপশনে ব্যবহারের জন্য নির্দিষ্ট হ্যাশট্যাগ
+HASHTAG = "#newweb"          # <-- আপনার চাওয়া হ্যাশট্যাগ
 BASE_URL = "https://mmsdesi.me/"
 
+# এখানে HTML পেস্ট করবেন অথবা বট থেকে "Send New HTML" দিয়ে পাঠাবেন
 HTML_CONTENT = """
 """
 
@@ -26,7 +27,7 @@ IGNORE_IMG_RE = re.compile(
     re.IGNORECASE
 )
 ALBUM_CONTAINER_RE = re.compile(
-    r"album|gallery|folder|collection|post|entry|card|item-box|video-block|media-group",
+    r"album|gallery|folder|collection|post|entry|card|item-box|video-block|media-group|group relative",
     re.IGNORECASE
 )
 TITLE_CLASS_RE = re.compile(
@@ -146,7 +147,7 @@ def _extract_title_from_box(box):
             if t:
                 return t
 
-    for p in box.find_all(["p", "strong", "b"]):
+    for p in box.find_all(["p", "strong", "b", "h3"]):
         t = _clean_title(p.get_text(" ", strip=True))
         if t:
             return t
@@ -301,7 +302,6 @@ def _finalize_albums(raw_albums, default_title=""):
             items.append((kind, url))
         if items:
             raw_title = _clean_title(a.get("title")) or default_title or ""
-            # শুধুমাত্র একটি হ্যাশট্যাগ নিশ্চিত করার জন্য
             clean_tag = HASHTAG.strip()
             final.append({
                 "title": f"{raw_title}\n\n{clean_tag}" if raw_title else clean_tag,
@@ -311,6 +311,10 @@ def _finalize_albums(raw_albums, default_title=""):
 
 
 def extract_albums(html_content):
+    """
+    HTML থেকে অ্যালবাম বের করে।
+    রিটার্ন: (page_title, albums_list)
+    """
     html_text = html_content if html_content and html_content.strip() else HTML_CONTENT
     if not html_text or not html_text.strip():
         return SITE_NAME, []
