@@ -127,9 +127,18 @@ RESOLVE_PARALLEL = max(1, int(os.environ.get("RESOLVE_PARALLEL", "3")))   # এ�
 
 # ========== Send Link ফিচারের সেটিংস ==========
 MAX_LINKS_QUEUE = 10              # একসাথে সর্বোচ্চ কয়টা লিংক কিউতে থাকতে পারবে (অ্যালবামের ফাইল সংখ্যার কোনো লিমিট নেই)
-# Send Link-এ একটি অ্যালবামের অংশগুলো (১০ ফাইলের গ্রুপ) দুই আইডিতে ভাগ হলে চ্যানেলে ক্রম ঠিক রাখবে কিনা
+# Send Link-এ একটি অ্যালবামের অংশগুলো (১০ ফাইলের গ্রুপ) একাধিক আইডিতে ভাগ হলে চ্যানেলে ক্রম ঠিক রাখবে কিনা
 # 1 = ক্রমানুসারে আপলোড (ডাউনলোড সমান্তরালে হয়), 0 = যে অংশ আগে তৈরি সেটা আগে যাবে (দ্রুততম)
 ORDERED_PARTS = os.environ.get("ORDERED_PARTS", "1") == "1"
+
+# ========== নতুন: ভূমিকা-ভিত্তিক আপলোড (Telethon x3) ==========
+# 1 = প্রথম আইডি শুধু ছবি ডাউনলোড/আপলোড করবে, বাকি আইডিগুলো শুধু ভিডিও (ভিডিও সমান ভাগে ভাগ হবে)।
+#     নিজের কাজ শেষ হলে বসে না থেকে অন্যজনের বাকি অংশ নিয়ে সাহায্য করবে।
+# 0 = আগের মতো মিশ্র অংশে ভাগ (যে আইডি আগে ফ্রি সে পরের অংশ নেবে)
+ROLE_SPLIT = os.environ.get("ROLE_SPLIT", "1") == "1"
+# 0 = Telethon সেশন থাকলে শুধু Telethon দিয়েই আপলোড (Pyrogram ইউজার আইডি আপলোডারে ধরা হবে না)
+# 1 = Pyrogram ইউজার আইডিও আপলোডারের তালিকায় যুক্ত হবে
+USE_PYRO_UPLOADERS = os.environ.get("USE_PYRO_UPLOADERS", "0") == "1"
 
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -352,6 +361,7 @@ async def do_backup():
 
         # ৩) তাতেও না হলে Telethon দিয়ে
         if new_id is None and TELETHON_AVAILABLE:
+            tc = None
             try:
                 t_ok, t_info = await ensure_telethon_connected()
                 tc = get_telethon()
@@ -1181,6 +1191,18 @@ def url_ext(url, kind="video"):
             return ext
     return ".mp4" if kind == "video" else ".jpg"
 
+def looks_like_bad_download(path):
+    """ডাউনলোড হওয়া ফাইল আসলে HTML/JSON এরর পেজ কিনা (MEDIA_EMPTY এড়াতে)"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64).lstrip().lower()
+        return (
+            head.startswith(b"<!doctype") or head.startswith(b"<html")
+            or head.startswith(b"<?xml") or head.startswith(b'{"')
+        )
+    except Exception:
+        return False
+
 async def download_file_with_details(url, dest_path, site_mod, state, progress_cb=None, max_bytes=None):
     # সাইট মডিউলে custom_download থাকলে সেটা ব্যবহার করবে
     if hasattr(site_mod, "custom_download"):
@@ -1394,40 +1416,109 @@ async def start_scan(client, user_id, site, override_html=None):
     active_scans[user_id] = state
     return True
 
+# ================= আপলোডার তালিকা ও ভূমিকা (Role) =================
+def _uploader_label(name, first_name):
+    fn = (first_name or "").strip()
+    return f"{name} ({fn[:14]})" if fn else name
+
 async def build_uploaders():
-    uploaders = []
-    seen_ids = set()
-    for name, c in pyro_ready:
-        try:
-            uid = (await c.get_me()).id
-        except Exception:
-            uid = None
-        if uid is not None:
-            if uid in seen_ids:
-                continue
-            seen_ids.add(uid)
-        uploaders.append({"type": "pyrogram", "client": c, "name": name})
+    # ১) Telethon আপলোডার (সবগুলো জীবিত সেশন)
+    tele = []
     for i, c in enumerate(telethon_clients, start=1):
         if id(c) in dead_telethon:
             continue
         ok, _ = await ensure_telethon_connected(c)
         if not ok:
             continue
+        uid = None
+        fn = ""
         try:
-            uid = (await c.get_me()).id
+            me = await c.get_me()
+            uid = me.id
+            fn = me.first_name or ""
         except AuthKeyDuplicatedError:
             mark_telethon_dead(c, "AuthKeyDuplicatedError")
             continue
         except Exception:
+            pass
+        name = f"Telethon {i}"
+        tele.append({
+            "type": "telethon", "client": c, "name": name,
+            "label": _uploader_label(name, fn), "uid": uid
+        })
+
+    # ২) Pyrogram ইউজার আপলোডার (শুধু USE_PYRO_UPLOADERS=1 হলে, অথবা Telethon একদম না থাকলে)
+    pyro = []
+    if USE_PYRO_UPLOADERS or not tele:
+        for name, c in pyro_ready:
             uid = None
+            fn = ""
+            try:
+                me = await c.get_me()
+                uid = me.id
+                fn = me.first_name or ""
+            except Exception:
+                pass
+            pyro.append({
+                "type": "pyrogram", "client": c, "name": name,
+                "label": _uploader_label(name, fn), "uid": uid
+            })
+
+    uploaders = []
+    seen_ids = set()
+    for u in pyro + tele:
+        uid = u.get("uid")
         if uid is not None:
             if uid in seen_ids:
                 continue
             seen_ids.add(uid)
-        uploaders.append({"type": "telethon", "client": c, "name": f"Telethon {i}"})
+        uploaders.append(u)
+
     if not uploaders:
-        uploaders.append({"type": "pyrogram", "client": bot, "name": "Bot Token"})
+        uploaders.append({"type": "pyrogram", "client": bot, "name": "Bot Token", "label": "Bot Token", "uid": None})
     return uploaders
+
+def assign_roles(uploaders):
+    """প্রথম আইডি = ছবি, বাকিরা = ভিডিও। একটাই আইডি থাকলে/ROLE_SPLIT বন্ধ থাকলে সবাই 'both'"""
+    n = len(uploaders)
+    for i, u in enumerate(uploaders):
+        if not ROLE_SPLIT or n == 1:
+            u["role"] = "both"
+        elif i == 0:
+            u["role"] = "photo"
+        else:
+            u["role"] = "video"
+
+def role_icon(role):
+    if role == "photo":
+        return "🖼️"
+    if role == "video":
+        return "🎬"
+    return "🎬🖼️"
+
+def engine_text(uploaders):
+    if uploaders[0]["name"] == "Bot Token":
+        return "Bot Token"
+    if len(uploaders) == 1:
+        return f"{uploaders[0].get('label') or uploaders[0]['name']} (User Session)"
+    kind = "Telethon" if all(u["type"] == "telethon" for u in uploaders) else "User"
+    p = sum(1 for u in uploaders if u.get("role") == "photo")
+    v = sum(1 for u in uploaders if u.get("role") == "video")
+    if p and v:
+        return f"{len(uploaders)} {kind} Accounts (🖼️ {p} ছবি + 🎬 {v} ভিডিও)"
+    return f"{len(uploaders)} {kind} Accounts (Parallel parts)"
+
+def new_worker_state(u):
+    return {
+        "label": u.get("label") or u["name"],
+        "icon": role_icon(u.get("role", "both")),
+        "role": u.get("role", "both"),
+        "action": "💤 Idle",
+        "busy": False,
+        "v": 0,
+        "p": 0,
+        "bytes": {},
+    }
 
 async def process_and_upload(client, user_id, site, override_html=None, state=None):
     if state is None:
@@ -1450,14 +1541,18 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
 
     def progress_text(header_action="", extra=""):
         lines = []
+        if workers:
+            busy_n = sum(1 for w_ in workers.values() if w_.get("a_idx"))
+            lines.append(f"👥 **Uploaders:** `{busy_n}/{len(workers)}` কাজ করছে")
         for wid in sorted(workers):
             ws = workers[wid]
             if not ws.get("a_idx"):
+                lines.append(f"⚪ `{safe(ws['name'])}` → 💤 Idle")
                 continue
             mb = sum(ws.get("bytes", {}).values()) // (1024 * 1024)
             mb_txt = f" | 📦 `{mb} MB`" if mb else ""
             lines.append(
-                f"👤 `{ws['name']}` → 📁 `{ws['a_idx']}/{total_albums}` `{safe(ws['title'])[:28]}`\n"
+                f"🟢 `{safe(ws['name'])}` → 📁 `{ws['a_idx']}/{total_albums}` `{safe(ws['title'])[:28]}`\n"
                 f"   {ws['action']}{mb_txt}"
             )
         body = "\n".join(lines) if lines else header_action
@@ -1623,7 +1718,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         if uploaders[0]["name"] == "Bot Token":
             uploader_mode = "Pyrogram Bot Token"
         elif len(uploaders) == 1:
-            uploader_mode = f"{uploaders[0]['name']} (User Session)"
+            uploader_mode = f"{uploaders[0].get('label') or uploaders[0]['name']} (User Session)"
         else:
             uploader_mode = f"{len(uploaders)} User Accounts (Album-level parallel)"
 
@@ -1700,6 +1795,13 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                     return {
                         "ok": False,
                         "err": f"• [Album {a_idx} {label} #{item_idx} Failed]\n  URL: {url[:45]}...\n  Reason: {err}"
+                    }
+                if looks_like_bad_download(temp):
+                    if os.path.exists(temp):
+                        os.remove(temp)
+                    return {
+                        "ok": False,
+                        "err": f"• [Album {a_idx} {label} #{item_idx} Failed]\n  URL: {url[:45]}...\n  Reason: Downloaded file is not valid media (HTML/JSON page)"
                     }
                 size = os.path.getsize(temp)
                 return {"ok": True, "file": {"path": temp, "kind": kind, "url": url, "size": size}}
@@ -1795,7 +1897,10 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             await cancellable_sleep(1, state)
 
         async def worker(wid, uploader):
-            workers[wid] = {"name": uploader["name"], "a_idx": 0, "title": "", "action": "", "bytes": {}}
+            workers[wid] = {
+                "name": uploader.get("label") or uploader["name"],
+                "a_idx": 0, "title": "", "action": "", "bytes": {}
+            }
             while True:
                 check_cancel(state)
                 try:
@@ -1885,7 +1990,8 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
 # (ক্যাপশন + নিচে #newweb) → শেষে চ্যানেলে "Album completed" মেসেজ।
 # একসাথে সর্বোচ্চ MAX_LINKS_QUEUE টা লিংক কিউতে থাকে; একটা শেষ হলে পরেরটা শুরু হয়।
 # অ্যালবামের ফাইল সংখ্যার কোনো লিমিট নেই।
-# একটি অ্যালবামের অংশগুলো (১০ ফাইলের গ্রুপ) একাধিক আইডিতে ভাগ হয়ে সমান্তরালে আপলোড হয়।
+# ভূমিকা-ভিত্তিক ভাগ (ROLE_SPLIT=1): প্রথম আইডি শুধু ছবি, বাকি আইডিগুলো শুধু ভিডিও।
+# কাজ শেষ হলে যে আইডি ফ্রি হয় সে অন্য লেনের বাকি অংশ নিয়ে সাহায্য করে (🤝)।
 
 def extract_links(text):
     found = []
@@ -1960,7 +2066,21 @@ def link_panel_text(job):
         shown = safe(cur.get("title") or cur["url"])[:40]
         lines.append(f"▶️ **চলছে:** `{cur['seq']}/{job['total']}` `{shown}`")
         lines.append(f"   {job.get('action', '')}{mb_txt}")
+
+    # ===== প্রতিটা আইডি এখন কী করছে =====
+    ws = job.get("workers") or {}
+    if ws:
+        busy_n = sum(1 for w in ws.values() if w.get("busy"))
+        lines.append("")
+        lines.append(f"👥 **Uploaders:** `{busy_n}/{len(ws)}` কাজ করছে")
+        for w in ws.values():
+            wmb = sum(w["bytes"].values()) // (1024 * 1024)
+            wmb_txt = f" | 📦 `{wmb} MB`" if wmb else ""
+            lines.append(f"{w['icon']} `{safe(w['label'])}` — ✅ 🎬`{w['v']}` 🖼️`{w['p']}`")
+            lines.append(f"   {'🟢' if w['busy'] else '⚪'} {w['action']}{wmb_txt}")
+
     if pending:
+        lines.append("")
         lines.append(f"⏳ **অপেক্ষায়:** `{len(pending)}`টি লিংক")
         for i, u in enumerate(pending[:5], start=1):
             lines.append(f"   {i}. `{safe(u)[:45]}`")
@@ -2002,7 +2122,7 @@ async def enqueue_links(client, user_id, site, links):
             "queue": [], "state": {"cancel": False}, "site_key": site["key"], "site_name": site["name"],
             "current": None, "done": 0, "total": 0, "ok": 0, "failed": 0, "up_v": 0, "up_p": 0,
             "results": [], "note": "", "closed": False, "engine": "", "action": "",
-            "mb": 0, "last_panel": 0.0, "task": None, "site": site,
+            "mb": 0, "last_panel": 0.0, "task": None, "site": site, "workers": {},
         }
         link_jobs[user_id] = job
         new_job = True
@@ -2098,61 +2218,126 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
     a_up_v = a_up_p = a_fail = 0
     n_workers = max(1, len(uploaders))
     sem = asyncio.Semaphore(DOWNLOAD_PARALLEL * n_workers)
-    bytes_map = {}
 
-    # অ্যালবামের ফাইলগুলো ১০টা করে অংশে ভাগ → কমন কিউ → যে আইডি আগে ফ্রি সে পরের অংশ নেয়
-    chunks = [items[i:i + MAX_ALBUM_BATCH] for i in range(0, len(items), MAX_ALBUM_BATCH)]
-    chunk_q = asyncio.Queue()
-    chunk_done = []
-    for ci, ch in enumerate(chunks):
-        chunk_q.put_nowait((ci, ch))
-        chunk_done.append(asyncio.Event())
-    actions = {}
+    # প্রতিটা আইডির লাইভ স্ট্যাটাস (প্যানেলে দেখানোর জন্য)
+    workers = job.get("workers")
+    if workers is None:
+        workers = job["workers"] = {}
+    for u_ in uploaders:
+        if u_["name"] not in workers:
+            workers[u_["name"]] = new_worker_state(u_)
 
-    def set_action(wname, text):
-        actions[wname] = text
-        if len(uploaders) <= 1:
-            job["action"] = text
-        else:
-            job["action"] = "\n   ".join(f"👤 {n}: {t}" for n, t in actions.items())
+    job["action"] = "⚙️ ডাউনলোড ও আপলোড চলছে"
 
-    async def dl_one(item_idx, kind, u):
+    def set_action(wname, text, busy=None):
+        w_ = workers.get(wname)
+        if w_ is None:
+            return
+        w_["action"] = text
+        if busy is not None:
+            w_["busy"] = busy
+
+    # ===== অংশ (part) তৈরি: লেন অনুযায়ী =====
+    # split_mode: 'photo' লেন (ছবি) + 'video' লেন (ভিডিও); নাহলে একটাই 'mixed' লেন (আগের মতো)
+    indexed = [(i + 1, kind, uu) for i, (kind, uu) in enumerate(items)]
+
+    def _chunks(lst, size):
+        return [lst[i:i + size] for i in range(0, len(lst), size)]
+
+    split_mode = (
+        any(x.get("role") == "photo" for x in uploaders)
+        and any(x.get("role") == "video" for x in uploaders)
+    )
+    lane_lists = {}
+    if split_mode:
+        photos = [e for e in indexed if e[1] != "video"]
+        videos = [e for e in indexed if e[1] == "video"]
+        n_vw = max(1, sum(1 for x in uploaders if x.get("role") == "video"))
+        if photos:
+            lane_lists["photo"] = _chunks(photos, MAX_ALBUM_BATCH)
+        if videos:
+            # ভিডিওগুলো ভিডিও-আইডিদের মধ্যে সমান ভাগে ভাগ (সর্বোচ্চ ১০টা করে অংশ)
+            vsize = max(1, min(MAX_ALBUM_BATCH, -(-len(videos) // n_vw)))
+            lane_lists["video"] = _chunks(videos, vsize)
+    else:
+        lane_lists["mixed"] = _chunks(indexed, MAX_ALBUM_BATCH)
+
+    lane_q = {}
+    lane_done = {}
+    lane_total = {}
+    for lane, parts in lane_lists.items():
+        q = asyncio.Queue()
+        lane_done[lane] = []
+        for ci, ch in enumerate(parts):
+            q.put_nowait((ci, ch))
+            lane_done[lane].append(asyncio.Event())
+        lane_q[lane] = q
+        lane_total[lane] = len(parts)
+
+    lane_icons = {"photo": "🖼️", "video": "🎬", "mixed": "📦"}
+
+    def lane_pref(uploader):
+        """আইডি আগে নিজের লেন থেকে কাজ নেবে, খালি হলে অন্য লেন থেকে সাহায্য করবে"""
+        if "mixed" in lane_q:
+            return ["mixed"]
+        order = ["photo", "video"] if uploader.get("role") == "photo" else ["video", "photo"]
+        return [l for l in order if l in lane_q]
+
+    async def dl_one(item_idx, kind, uu, wname):
         label = "Video" if kind == "video" else "Photo"
-        temp = f"tmplink_{user_id}_{seq}_{item_idx}{url_ext(u, kind)}"
+        temp = f"tmplink_{user_id}_{seq}_{item_idx}{url_ext(uu, kind)}"
 
         async def progress(downloaded, total):
-            bytes_map[item_idx] = downloaded
-            job["mb"] = sum(bytes_map.values()) // (1024 * 1024)
+            w_ = workers.get(wname)
+            if w_ is not None:
+                w_["bytes"][item_idx] = downloaded
+            job["mb"] = sum(sum(x["bytes"].values()) for x in workers.values()) // (1024 * 1024)
             await refresh_link_panel(client, user_id, job)
 
         async with sem:
             try:
                 check_cancel(state)
-                ok, err = await download_file_with_details(u, temp, site_mod, state, progress, MAX_FILE_BYTES)
+                ok, err = await download_file_with_details(uu, temp, site_mod, state, progress, MAX_FILE_BYTES)
             except ScanCancelled:
                 return {"cancelled": True, "ok": False}
-        bytes_map.pop(item_idx, None)
+        w_ = workers.get(wname)
+        if w_ is not None:
+            w_["bytes"].pop(item_idx, None)
         if not ok:
             if os.path.exists(temp):
                 os.remove(temp)
             return {
                 "ok": False,
-                "err": f"• [Link {seq} {label} #{item_idx} Failed]\n  URL: {u[:45]}...\n  Reason: {err}"
+                "err": f"• [Link {seq} {label} #{item_idx} Failed]\n  URL: {uu[:45]}...\n  Reason: {err}"
+            }
+        if looks_like_bad_download(temp):
+            if os.path.exists(temp):
+                os.remove(temp)
+            return {
+                "ok": False,
+                "err": f"• [Link {seq} {label} #{item_idx} Failed]\n  URL: {uu[:45]}...\n  Reason: Downloaded file is not valid media (HTML/JSON page)"
             }
         size = os.path.getsize(temp)
-        return {"ok": True, "file": {"path": temp, "kind": kind, "url": u, "size": size}}
+        return {"ok": True, "file": {"path": temp, "kind": kind, "url": uu, "size": size}}
 
-    async def process_chunk(ci, chunk, uploader):
+    async def process_chunk(lane, ci, chunk, uploader):
         nonlocal a_up_v, a_up_p, a_fail
         wname = uploader["name"]
-        start = ci * MAX_ALBUM_BATCH
+        w = workers[wname]
+        icon = lane_icons[lane]
+        total_parts = lane_total[lane]
+        role = uploader.get("role", "both")
+        own_lane = "photo" if role == "photo" else ("video" if role == "video" else lane)
+        help_mark = " 🤝" if lane != own_lane else ""
+        part_txt = f"{icon} Part {ci + 1}/{total_parts}"
+
         check_cancel(state)
-        set_action(wname, f"⬇️ Downloading `{start + 1}-{start + len(chunk)}/{len(items)}`")
+        set_action(wname, f"⬇️ Downloading {part_txt}: `{len(chunk)} files`{help_mark}", busy=True)
         await refresh_link_panel(client, user_id, job, force=True)
 
         results = await asyncio.gather(*[
-            dl_one(start + off + 1, kind, u)
-            for off, (kind, u) in enumerate(chunk)
+            dl_one(idx, kind, uu, wname)
+            for idx, kind, uu in chunk
         ])
         if any(r.get("cancelled") for r in results):
             raise ScanCancelled()
@@ -2179,17 +2364,18 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
         for g in groups:
             check_cancel(state)
 
-            # ক্রম ঠিক রাখতে আগের অংশ আপলোড শেষ না হওয়া পর্যন্ত অপেক্ষা
+            # ক্রম ঠিক রাখতে একই লেনের আগের অংশ আপলোড শেষ না হওয়া পর্যন্ত অপেক্ষা
             if ORDERED_PARTS and ci > 0 and not waited:
-                set_action(wname, "⏳ আগের অংশের আপলোডের জন্য অপেক্ষা...")
+                set_action(wname, f"⏳ আগের অংশের আপলোডের জন্য অপেক্ষা... ({part_txt}){help_mark}", busy=True)
                 await refresh_link_panel(client, user_id, job, force=True)
-                await run_cancellable(chunk_done[ci - 1].wait(), state)
+                await run_cancellable(lane_done[lane][ci - 1].wait(), state)
                 waited = True
 
             mb = sum(f["size"] for f in g) // (1024 * 1024)
-            set_action(wname, f"⬆️ Uploading Part `{ci + 1}/{len(chunks)}`: `{len(g)} files, {mb} MB`")
+            set_action(wname, f"⬆️ Uploading {part_txt}: `{len(g)} files, {mb} MB`{help_mark}", busy=True)
+            w["bytes"].clear()
             await refresh_link_panel(client, user_id, job, force=True)
-            multi = len(items) > MAX_ALBUM_BATCH
+            multi = total_parts > 1
             ok_files, failed = await upload_album_batch(
                 g, title, seq, job["total"], ci + 1, multi, hashtag, state, uploader
             )
@@ -2198,30 +2384,46 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
             a_up_p += p
             job["up_v"] += v
             job["up_p"] += p
+            w["v"] += v
+            w["p"] += p
             a_fail += len(errs)
+            await refresh_link_panel(client, user_id, job, force=True)
             await cancellable_sleep(1, state)
 
-        set_action(wname, "✅ Idle")
+        set_action(wname, f"✅ {part_txt} শেষ", busy=False)
 
     async def link_worker(uploader):
         nonlocal a_fail
+        wname = uploader["name"]
+        pref = lane_pref(uploader)
         while True:
             check_cancel(state)
-            try:
-                ci, ch = chunk_q.get_nowait()
-            except asyncio.QueueEmpty:
+            got = None
+            for lane in pref:
+                try:
+                    ci, ch = lane_q[lane].get_nowait()
+                    got = (lane, ci, ch)
+                    break
+                except asyncio.QueueEmpty:
+                    continue
+            if got is None:
+                set_action(wname, "✅ Idle (কাজ শেষ)", busy=False)
+                await refresh_link_panel(client, user_id, job, force=True)
                 return
+            lane, ci, ch = got
             try:
-                await process_chunk(ci, ch, uploader)
+                await process_chunk(lane, ci, ch, uploader)
             except ScanCancelled:
                 raise
             except Exception as ce:
                 a_fail += len(ch)
-                print(f"⚠️ Link {seq} part {ci + 1} crashed ({uploader['name']}): {type(ce).__name__}: {ce}")
+                set_action(wname, f"❌ Part {ci + 1} ব্যর্থ: {type(ce).__name__}", busy=False)
+                print(f"⚠️ Link {seq} {lane} part {ci + 1} crashed ({uploader['name']}): {type(ce).__name__}: {ce}")
             finally:
-                chunk_done[ci].set()
+                lane_done[lane][ci].set()
 
     try:
+        await refresh_link_panel(client, user_id, job, force=True)
         outcomes = await asyncio.gather(
             *[link_worker(u_) for u_ in uploaders],
             return_exceptions=True
@@ -2233,6 +2435,10 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
             if isinstance(o, BaseException) and not isinstance(o, asyncio.CancelledError):
                 raise o
     finally:
+        for w_ in workers.values():
+            w_["busy"] = False
+            w_["bytes"].clear()
+            w_["action"] = "💤 Idle"
         for fn in glob.glob(f"tmplink_{user_id}_{seq}_*"):
             try:
                 os.remove(fn)
@@ -2276,12 +2482,9 @@ async def process_link_queue(client, user_id, job):
     try:
         job["action"] = "⏳ আপলোডার প্রস্তুত হচ্ছে..."
         uploaders = await build_uploaders()
-        if uploaders[0]["name"] == "Bot Token":
-            job["engine"] = "Bot Token"
-        elif len(uploaders) == 1:
-            job["engine"] = f"{uploaders[0]['name']} (User Session)"
-        else:
-            job["engine"] = f"{len(uploaders)} User Accounts (Parallel parts)"
+        assign_roles(uploaders)
+        job["engine"] = engine_text(uploaders)
+        job["workers"] = {u_["name"]: new_worker_state(u_) for u_ in uploaders}
 
         seq = 0
         while True:
@@ -2375,6 +2578,12 @@ async def process_link_queue(client, user_id, job):
     )
     if dropped:
         summary += f"🗑️ **বাতিল হওয়া লিংক:** `{dropped}`\n"
+    wr = job.get("workers") or {}
+    if wr:
+        rep = "\n".join(
+            f"{w['icon']} {safe(w['label'])}: 🎬{w['v']} 🖼️{w['p']}" for w in wr.values()
+        )
+        summary += f"\n👥 **Uploader Report:**\n```text\n{rep}\n```"
     if job["results"]:
         shown = "\n".join(job["results"][-8:])
         if len(job["results"]) > 8:
@@ -2425,6 +2634,7 @@ async def main():
     print(f"🤖 Bot is running. Loaded {len(loaded_sites)} site modules. "
           f"Pyrogram uploader accounts: {len(pyro_ready)} | Telethon accounts: {len(telethon_clients)}")
     print(f"📌 MAX_ALBUMS_PER_SCAN = {MAX_ALBUMS_PER_SCAN} | DEFAULT_HASHTAG = {DEFAULT_HASHTAG} | MAX_LINKS_QUEUE = {MAX_LINKS_QUEUE} | ORDERED_PARTS = {ORDERED_PARTS}")
+    print(f"🎛️ ROLE_SPLIT = {ROLE_SPLIT} | USE_PYRO_UPLOADERS = {USE_PYRO_UPLOADERS}")
 
     await idle()
 
