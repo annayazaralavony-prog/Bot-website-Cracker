@@ -113,9 +113,12 @@ MAX_ALBUM_BATCH = 10
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "2000")) * 1024 * 1024
 MAX_BATCH_BYTES = int(os.environ.get("MAX_BATCH_MB", "2000")) * 1024 * 1024
 
-# ========== নতুন সেটিংস ==========
+# ========== সেটিংস ==========
 MAX_ALBUMS_PER_SCAN = int(os.environ.get("MAX_ALBUMS_PER_SCAN", "100"))
-DEFAULT_HASHTAG = "#reels"
+# সাইট ফাইলে HASHTAG না থাকলে এটা ব্যবহার হবে (mmsdesi.py এ HASHTAG = "#newweb")
+DEFAULT_HASHTAG = os.environ.get("DEFAULT_HASHTAG", "#newweb").strip() or "#newweb"
+if not DEFAULT_HASHTAG.startswith("#"):
+    DEFAULT_HASHTAG = f"#{DEFAULT_HASHTAG}"
 REST_CAPTION_HASHTAG = os.environ.get("REST_CAPTION_HASHTAG", "0") == "1"
 ALBUM_REPORT_IN_CHANNEL = os.environ.get("ALBUM_REPORT_IN_CHANNEL", "0") == "1"
 ORDERED_ALBUMS = os.environ.get("ORDERED_ALBUMS", "1") == "1"
@@ -563,6 +566,10 @@ def find_site_by_label(label):
             return site
     return None
 
+def site_hashtag(site):
+    """সাইটের হ্যাশট্যাগ (mmsdesi এর জন্য #newweb)"""
+    return (site.get("hashtag") if site else None) or DEFAULT_HASHTAG
+
 def get_site_albums(site, override_html=None):
     mod = site["module"]
     html_content = override_html if override_html is not None else getattr(mod, "HTML_CONTENT", "")
@@ -628,16 +635,8 @@ async def run_cancellable(coro, state):
 
 def get_home_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎥 RedReels Menu", callback_data="action_redreels_menu")],
         [InlineKeyboardButton("🔄 Reload Site Files", callback_data="action_reload_sites")],
         [InlineKeyboardButton("🔄 Sync Storage Channel", callback_data="action_sync_channel")]
-    ])
-
-def get_redreels_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Send HTML Files (4-5 Max)", callback_data="action_redreels_html")],
-        [InlineKeyboardButton("🚀 Start Infinite Scan (100/scan)", callback_data="action_redreels_scan")],
-        [InlineKeyboardButton("🏠 Home", callback_data="menu_home")]
     ])
 
 def get_site_keyboard(site_key):
@@ -967,45 +966,6 @@ async def handle_callbacks(client, cq):
                 get_home_keyboard()
             )
 
-        elif data == "action_redreels_menu":
-            sess["state"] = "IDLE"
-            await safe_answer(cq)
-            await update_panel(
-                client, user_id,
-                f"🎥 **RedReels Scanner Menu**\n\n"
-                f"• আপনার অনুমোদিত ওয়েবসাইটের HTML ফাইল আপলোড করুন।\n"
-                f"• প্রতি স্ক্যানে ১০০টি করে ভিডিও স্ক্যান হবে।\n"
-                f"• কাজ শেষ হলে আবার স্ক্যান করলে ঠিক তারপর থেকে শুরু হবে।\n"
-                f"• ডুপ্লিকেট আপলোড আটকাতে ৩টি সেশন আইডি প্যারালালি কাজ করবে।\n\n"
-                f"নিচের অপশনগুলো ব্যবহার করুন:",
-                get_redreels_keyboard()
-            )
-
-        elif data == "action_redreels_html":
-            sess["state"] = "WAITING_REDREELS_HTML"
-            await safe_answer(cq)
-            await update_panel(
-                client, user_id,
-                f"📄 **RedReels HTML Upload**\n\n"
-                f"• সর্বোচ্চ ৪-৫টি `.html` ফাইল একবারে বা এক এক করে পাঠাতে পারেন।\n"
-                f"• ফাইলগুলোতে 'Trending' বা 'GIFs' সেকশনের কোড থাকতে হবে।\n\n"
-                f"এখন ফাইলগুলো পাঠান 👇",
-                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to RedReels", callback_data="action_redreels_menu")]])
-            )
-
-        elif data == "action_redreels_scan":
-            await safe_answer(cq, "Starting Infinite Scan for RedReels...")
-
-            site = loaded_sites.get("redreels")
-            if not site:
-                await update_panel(client, user_id, "⚠️ **RedReels Site Module Not Found!**\nPlease ensure `redreels.py` is in the `sites/` folder.", get_redreels_keyboard())
-                return
-
-            override = sess.get("custom_html", {}).get("redreels") or db_get_site_html("redreels")
-            started = await start_scan(client, user_id, site, override)
-            if not started:
-                await update_panel(client, user_id, "⚠️ একটি স্ক্যান ইতিমধ্যে চলছে। আগে সেটা শেষ করুন অথবা ক্যানসেল করুন।", get_redreels_keyboard())
-
         elif data == "action_sync_channel":
             await safe_answer(cq, "Syncing storage channel via Telethon...")
             t_ok, t_err = await ensure_telethon_connected()
@@ -1087,7 +1047,7 @@ async def handle_callbacks(client, cq):
                 f"• অ্যালবামের লিংক পাঠান (একসাথে একাধিক লিংকও পাঠানো যায়)\n"
                 f"• সর্বোচ্চ **{MAX_LINKS_QUEUE}**টা লিংক একসাথে কিউতে থাকতে পারবে\n"
                 f"• একটা শেষ হলে বট পরেরটা ধরবে\n"
-                f"• অ্যালবামের সব ফটো/ভিডিও ক্যাপশন + `{DEFAULT_HASHTAG}` সহ স্টোরেজ চ্যানেলে যাবে\n"
+                f"• অ্যালবামের সব ফটো/ভিডিও টাইটেল ক্যাপশন + নিচে `{site_hashtag(site)}` সহ স্টোরেজ চ্যানেলে যাবে\n"
                 f"• অ্যালবাম শেষ হলে চ্যানেলে কমপ্লিট মেসেজ যাবে\n\n"
                 f"এখন লিংক পাঠান 👇",
                 InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]])
@@ -1181,51 +1141,10 @@ async def handle_text(client, message):
             await message.reply("⚠️ এটা HTML কোড মনে হচ্ছে না। সম্পূর্ণ HTML পেস্ট করুন বা `.html` ফাইল পাঠান।")
             return
 
-    if sess.get("state") == "WAITING_REDREELS_HTML":
-        looks_like_html = bool(re.search(r"<\s*(!doctype|html|body|div|a\s|img|video|source)", text, re.I))
-        if text and looks_like_html:
-            save_site_html("redreels", text)
-            sess.setdefault("custom_html", {})["redreels"] = text
-            sess["state"] = "IDLE"
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            await update_panel(client, user_id, "✅ **RedReels HTML Saved Successfully!**\nNow you can start the scan.", get_redreels_keyboard())
-            return
-        else:
-            await message.reply("⚠️ এটা HTML কোড মনে হচ্ছে না। সম্পূর্ণ HTML পেস্ট করুন বা `.html` ফাইল পাঠান।")
-            return
-
 @bot.on_message(filters.private & filters.document)
 async def handle_document(client, message):
     user_id = message.from_user.id
     sess = user_sessions.setdefault(user_id, {"state": "IDLE", "custom_html": {}})
-
-    if sess.get("state") == "WAITING_REDREELS_HTML":
-        doc = message.document
-        if not (doc.file_name or "").lower().endswith((".html", ".htm", ".txt")):
-            await message.reply("শুধু `.html` বা `.txt` ফাইল সাপোর্ট করে।")
-            return
-
-        path = await message.download()
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                html_content = f.read()
-
-            # আগের সেভ করা HTML (মেমরি বা ডাটাবেস) + নতুন ফাইল
-            existing_html = sess.setdefault("custom_html", {}).get("redreels") or db_get_site_html("redreels") or ""
-            combined_html = existing_html + "\n" + html_content
-
-            save_site_html("redreels", combined_html)
-            sess["custom_html"]["redreels"] = combined_html
-            file_count = max(1, combined_html.lower().count("<!doctype html"))
-            await update_panel(client, user_id, f"✅ **RedReels HTML File Saved!**\nTotal combined files: {file_count}", get_redreels_keyboard())
-
-        finally:
-            if os.path.exists(path):
-                os.remove(path)
-        return
 
     if sess.get("state") != "WAITING_HTML":
         return
@@ -1316,10 +1235,13 @@ async def download_file_with_details(url, dest_path, site_mod, state, progress_c
     return False, f"{last_err} (failed after 3 attempts)"
 
 def build_caption(title, a_idx, total_albums, part, multi_part, hashtag):
+    """ক্যাপশন = অ্যালবামের টাইটেল (বোল্ড) + নিচে হ্যাশট্যাগ (#newweb)"""
     single_tag = "#" + hashtag.lstrip("#").split()[0] if hashtag else DEFAULT_HASHTAG
     tag_html = htmllib.escape(single_tag)
 
-    clean_title = ""
+    # টাইটেলের ভেতরের যেকোনো হ্যাশট্যাগ বাদ দিয়ে পরিষ্কার টাইটেল
+    clean_title = re.sub(r"#\S+", "", str(title or ""))
+    clean_title = re.sub(r"\s+", " ", clean_title).strip()
 
     if clean_title:
         first = f"<b>{htmllib.escape(clean_title[:200])}</b>\n\n{tag_html}"
@@ -1597,8 +1519,8 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         state = {"cancel": False}
     site_key = site["key"]
     site_mod = site["module"]
-    hashtag = DEFAULT_HASHTAG
-    end_kb = get_redreels_keyboard() if site_key == "redreels" else get_site_keyboard(site_key)
+    hashtag = site_hashtag(site)
+    end_kb = get_site_keyboard(site_key)
     cancel_kb = get_cancel_keyboard()
 
     up_v = up_p = skipped = albums_done = 0
@@ -2109,7 +2031,7 @@ def link_panel_text(job):
     lines = [
         f"🔗 **Link Queue** — `{safe(job['site_name'])}`",
         f"⚡ **Engine:** `{safe(job.get('engine') or '...')}`",
-        f"🏷️ **Hashtag:** `{DEFAULT_HASHTAG}`",
+        f"🏷️ **Hashtag:** `{site_hashtag(job.get('site'))}`",
         "",
     ]
     if cur:
@@ -2211,7 +2133,7 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
     site = job["site"]
     site_key = site["key"]
     site_mod = site["module"]
-    hashtag = DEFAULT_HASHTAG
+    hashtag = site_hashtag(site)
 
     resolve_fn = getattr(site_mod, "resolve_album", None)
     if resolve_fn is None:
@@ -2623,10 +2545,10 @@ async def process_link_queue(client, user_id, job):
     summary = (
         f"{head}\n\n"
         f"🌐 **Website:** `{safe(job['site_name'])}`\n"
-        f"🏷️ **Hashtag:** `{DEFAULT_HASHTAG}`\n"
+        f"🏷️ **Hashtag:** `{site_hashtag(site)}`\n"
         f"🔗 **Links Processed:** `{job['done']}/{job['total']}`\n"
         f"✅ **Successful:** `{job['ok']}` | ❌ **Failed:** `{job['failed']}`\n"
-                f"🎬 **Videos Uploaded:** `{job['up_v']}`\n"
+        f"🎬 **Videos Uploaded:** `{job['up_v']}`\n"
         f"🖼️ **Photos Uploaded:** `{job['up_p']}`\n"
     )
     if dropped:
