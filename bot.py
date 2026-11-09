@@ -16,11 +16,10 @@ from datetime import datetime, timezone
 from threading import Thread
 from flask import Flask
 
-# ================= Python 3.14 Event Loop Fix =================
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+# ================= Event Loop Fix (Python 3.10 - 3.14) =================
+# Pyrogram/Pyrofork ইমপোর্ট ও Client তৈরির আগেই একটা loop বানিয়ে সেট করতে হবে।
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 from pyrogram import Client, filters, idle, enums
 from pyrogram.types import (
@@ -102,7 +101,7 @@ def _collect_pyro_sessions():
 
 DOWNLOAD_PARALLEL = max(1, int(os.environ.get("DOWNLOAD_PARALLEL", "5")))
 SITES_DIR = "sites"
-DB_PATH = os.environ.get("DB_PATH", "scraped_data.db")   
+DB_PATH = os.environ.get("DB_PATH", "scraped_data.db")
 _db_dir = os.path.dirname(DB_PATH)
 if _db_dir:
     os.makedirs(_db_dir, exist_ok=True)
@@ -115,18 +114,25 @@ MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "2000")) * 1024 * 1024
 MAX_BATCH_BYTES = int(os.environ.get("MAX_BATCH_MB", "2000")) * 1024 * 1024
 
 # ========== নতুন সেটিংস ==========
-MAX_ALBUMS_PER_SCAN = int(os.environ.get("MAX_ALBUMS_PER_SCAN", "100")) 
-DEFAULT_HASHTAG = "#reels"       
+MAX_ALBUMS_PER_SCAN = int(os.environ.get("MAX_ALBUMS_PER_SCAN", "100"))
+DEFAULT_HASHTAG = "#reels"
 REST_CAPTION_HASHTAG = os.environ.get("REST_CAPTION_HASHTAG", "0") == "1"
 ALBUM_REPORT_IN_CHANNEL = os.environ.get("ALBUM_REPORT_IN_CHANNEL", "0") == "1"
 ORDERED_ALBUMS = os.environ.get("ORDERED_ALBUMS", "1") == "1"
-RESOLVE_PARALLEL = max(1, int(os.environ.get("RESOLVE_PARALLEL", "3")))   
+RESOLVE_PARALLEL = max(1, int(os.environ.get("RESOLVE_PARALLEL", "3")))
 
 # ========== Send Link ফিচারের সেটিংস ==========
-MAX_LINKS_QUEUE = 10              
+MAX_LINKS_QUEUE = 10
 ORDERED_PARTS = os.environ.get("ORDERED_PARTS", "1") == "1"
 ROLE_SPLIT = os.environ.get("ROLE_SPLIT", "1") == "1"
 USE_PYRO_UPLOADERS = os.environ.get("USE_PYRO_UPLOADERS", "0") == "1"
+
+DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
 
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -144,11 +150,11 @@ if TELETHON_AVAILABLE:
         telethon_clients.append(TelegramClient(StringSession(_sess), API_ID, API_HASH))
 
 # ---- Telethon সেশন স্টেট ট্র্যাকিং ----
-dead_telethon = {}      
-connect_locks = {}      
-primed_clients = set()  
-backup_primed_pyro = set()      
-backup_primed_telethon = set()  
+dead_telethon = {}
+connect_locks = {}
+primed_clients = set()
+backup_primed_pyro = set()
+backup_primed_telethon = set()
 
 def mark_telethon_dead(c, reason):
     if id(c) not in dead_telethon:
@@ -583,7 +589,7 @@ def get_site_albums(site, override_html=None):
             seen.add(url)
             items.append((kind, url))
         if items or a.get("needs_resolve"):
-            entry = dict(a)   
+            entry = dict(a)
             entry["title"] = a.get("title") or f"Album {idx}"
             entry["items"] = items
             clean_albums.append(entry)
@@ -594,7 +600,7 @@ discover_sites()
 # ================= ইউজার সেশন ও বাটন =================
 user_sessions = {}
 active_scans = {}
-link_jobs = {}          
+link_jobs = {}
 
 def link_job_running(user_id):
     job = link_jobs.get(user_id)
@@ -967,7 +973,7 @@ async def handle_callbacks(client, cq):
             await update_panel(
                 client, user_id,
                 f"🎥 **RedReels Scanner Menu**\n\n"
-                f"• আপনার অনুমোদিত ওয়েবসাইটের HTML ফাইল আপলোড করুন।\n"
+                f"• আপনার অনুমোদিত ওয়েবসাইটের HTML ফাইল আপলোড করুন।\n"
                 f"• প্রতি স্ক্যানে ১০০টি করে ভিডিও স্ক্যান হবে।\n"
                 f"• কাজ শেষ হলে আবার স্ক্যান করলে ঠিক তারপর থেকে শুরু হবে।\n"
                 f"• ডুপ্লিকেট আপলোড আটকাতে ৩টি সেশন আইডি প্যারালালি কাজ করবে।\n\n"
@@ -989,17 +995,16 @@ async def handle_callbacks(client, cq):
 
         elif data == "action_redreels_scan":
             await safe_answer(cq, "Starting Infinite Scan for RedReels...")
-            
-            site = loaded_sites.get("redreels") 
+
+            site = loaded_sites.get("redreels")
             if not site:
                 await update_panel(client, user_id, "⚠️ **RedReels Site Module Not Found!**\nPlease ensure `redreels.py` is in the `sites/` folder.", get_redreels_keyboard())
                 return
-            
+
             override = sess.get("custom_html", {}).get("redreels") or db_get_site_html("redreels")
             started = await start_scan(client, user_id, site, override)
             if not started:
                 await update_panel(client, user_id, "⚠️ একটি স্ক্যান ইতিমধ্যে চলছে। আগে সেটা শেষ করুন অথবা ক্যানসেল করুন।", get_redreels_keyboard())
-
 
         elif data == "action_sync_channel":
             await safe_answer(cq, "Syncing storage channel via Telethon...")
@@ -1174,7 +1179,8 @@ async def handle_text(client, message):
             return
         else:
             await message.reply("⚠️ এটা HTML কোড মনে হচ্ছে না। সম্পূর্ণ HTML পেস্ট করুন বা `.html` ফাইল পাঠান।")
-            
+            return
+
     if sess.get("state") == "WAITING_REDREELS_HTML":
         looks_like_html = bool(re.search(r"<\s*(!doctype|html|body|div|a\s|img|video|source)", text, re.I))
         if text and looks_like_html:
@@ -1188,13 +1194,14 @@ async def handle_text(client, message):
             await update_panel(client, user_id, "✅ **RedReels HTML Saved Successfully!**\nNow you can start the scan.", get_redreels_keyboard())
             return
         else:
-             await message.reply("⚠️ এটা HTML কোড মনে হচ্ছে না। সম্পূর্ণ HTML পেস্ট করুন বা `.html` ফাইল পাঠান।")
+            await message.reply("⚠️ এটা HTML কোড মনে হচ্ছে না। সম্পূর্ণ HTML পেস্ট করুন বা `.html` ফাইল পাঠান।")
+            return
 
 @bot.on_message(filters.private & filters.document)
 async def handle_document(client, message):
     user_id = message.from_user.id
     sess = user_sessions.setdefault(user_id, {"state": "IDLE", "custom_html": {}})
-    
+
     if sess.get("state") == "WAITING_REDREELS_HTML":
         doc = message.document
         if not (doc.file_name or "").lower().endswith((".html", ".htm", ".txt")):
@@ -1205,19 +1212,21 @@ async def handle_document(client, message):
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 html_content = f.read()
-            
-            existing_html = sess.setdefault("custom_html", {}).get("redreels", "")
-            combined_html = existing_html + "\n" + html_content 
-            
+
+            # আগের সেভ করা HTML (মেমরি বা ডাটাবেস) + নতুন ফাইল
+            existing_html = sess.setdefault("custom_html", {}).get("redreels") or db_get_site_html("redreels") or ""
+            combined_html = existing_html + "\n" + html_content
+
             save_site_html("redreels", combined_html)
             sess["custom_html"]["redreels"] = combined_html
-            await update_panel(client, user_id, f"✅ **RedReels HTML File Saved!**\nTotal combined files: {len(combined_html.split('<!doctype html>')) -1}", get_redreels_keyboard())
-            
+            file_count = max(1, combined_html.lower().count("<!doctype html"))
+            await update_panel(client, user_id, f"✅ **RedReels HTML File Saved!**\nTotal combined files: {file_count}", get_redreels_keyboard())
+
         finally:
             if os.path.exists(path):
                 os.remove(path)
         return
-        
+
     if sess.get("state") != "WAITING_HTML":
         return
 
@@ -1273,7 +1282,7 @@ async def download_file_with_details(url, dest_path, site_mod, state, progress_c
     for attempt in range(1, 4):
         try:
             check_cancel(state)
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(headers=DOWNLOAD_HEADERS) as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
                     if resp.status != 200:
                         return False, f"HTTP {resp.status}"
@@ -1309,9 +1318,9 @@ async def download_file_with_details(url, dest_path, site_mod, state, progress_c
 def build_caption(title, a_idx, total_albums, part, multi_part, hashtag):
     single_tag = "#" + hashtag.lstrip("#").split()[0] if hashtag else DEFAULT_HASHTAG
     tag_html = htmllib.escape(single_tag)
-    
+
     clean_title = ""
-    
+
     if clean_title:
         first = f"<b>{htmllib.escape(clean_title[:200])}</b>\n\n{tag_html}"
     else:
@@ -1476,7 +1485,7 @@ async def start_scan(client, user_id, site, override_html=None):
     return True
 
 # ================= আপলোডার তালিকা ও ভূমিকা (Role) =================
-skipped_uploaders = []   
+skipped_uploaders = []
 
 def _uploader_label(name, first_name):
     fn = (first_name or "").strip()
@@ -1588,7 +1597,7 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         state = {"cancel": False}
     site_key = site["key"]
     site_mod = site["module"]
-    hashtag = DEFAULT_HASHTAG   
+    hashtag = DEFAULT_HASHTAG
     end_kb = get_redreels_keyboard() if site_key == "redreels" else get_site_keyboard(site_key)
     cancel_kb = get_cancel_keyboard()
 
@@ -2539,7 +2548,7 @@ async def process_link_queue(client, user_id, job):
                 job["closed"] = True
                 break
             if not job["queue"]:
-                job["closed"] = True   
+                job["closed"] = True
                 break
 
             url = job["queue"].pop(0)
@@ -2649,7 +2658,7 @@ def home():
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    web_app.run(host="0.0.0.0", port=port)
+    web_app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
 
 async def main():
     global backup_event, startup_db_status
@@ -2704,4 +2713,4 @@ async def main():
 
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
-    asyncio.get_event_loop().run_until_complete(main())
+    loop.run_until_complete(main())
