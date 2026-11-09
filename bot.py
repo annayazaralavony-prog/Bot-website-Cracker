@@ -58,7 +58,7 @@ except ImportError:
 API_ID = int(os.environ.get("API_ID", "123456"))
 API_HASH = os.environ.get("API_HASH", "your_api_hash")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
-STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", "-1004492974143"))
+STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", "-1004306320018"))
 TELETHON_SESSION_STRING = os.environ.get("TELETHON_SESSION_STRING", "").strip()
 
 # ---- একাধিক অ্যাকাউন্ট ----
