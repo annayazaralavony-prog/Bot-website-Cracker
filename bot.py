@@ -2626,7 +2626,7 @@ async def process_link_queue(client, user_id, job):
         f"🏷️ **Hashtag:** `{DEFAULT_HASHTAG}`\n"
         f"🔗 **Links Processed:** `{job['done']}/{job['total']}`\n"
         f"✅ **Successful:** `{job['ok']}` | ❌ **Failed:** `{job['failed']}`\n"
-        f"🎬 **Videos Uploaded:** `{job['up_v']}`\n"
+                f"🎬 **Videos Uploaded:** `{job['up_v']}`\n"
         f"🖼️ **Photos Uploaded:** `{job['up_p']}`\n"
     )
     if dropped:
