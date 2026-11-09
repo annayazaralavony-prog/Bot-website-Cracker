@@ -1417,18 +1417,23 @@ async def start_scan(client, user_id, site, override_html=None):
     return True
 
 # ================= আপলোডার তালিকা ও ভূমিকা (Role) =================
+skipped_uploaders = []   # যেসব সেশন আপলোডারে ধরা হয়নি, তাদের কারণ
+
 def _uploader_label(name, first_name):
     fn = (first_name or "").strip()
     return f"{name} ({fn[:14]})" if fn else name
 
 async def build_uploaders():
     # ১) Telethon আপলোডার (সবগুলো জীবিত সেশন)
+    skipped_uploaders.clear()
     tele = []
     for i, c in enumerate(telethon_clients, start=1):
         if id(c) in dead_telethon:
+            skipped_uploaders.append(f"Telethon {i}: অকেজো ({str(dead_telethon.get(id(c)))[:70]})")
             continue
-        ok, _ = await ensure_telethon_connected(c)
+        ok, why = await ensure_telethon_connected(c)
         if not ok:
+            skipped_uploaders.append(f"Telethon {i}: কানেক্ট হয়নি ({str(why)[:70]})")
             continue
         uid = None
         fn = ""
@@ -1438,6 +1443,7 @@ async def build_uploaders():
             fn = me.first_name or ""
         except AuthKeyDuplicatedError:
             mark_telethon_dead(c, "AuthKeyDuplicatedError")
+            skipped_uploaders.append(f"Telethon {i}: AuthKeyDuplicatedError (সেশন অকেজো)")
             continue
         except Exception:
             pass
@@ -1466,10 +1472,11 @@ async def build_uploaders():
 
     uploaders = []
     seen_ids = set()
-    for u in pyro + tele:
+    for u in tele + pyro:
         uid = u.get("uid")
         if uid is not None:
             if uid in seen_ids:
+                skipped_uploaders.append(f"{u['name']}: একই অ্যাকাউন্ট ({u.get('label')}) আগেই আছে, তাই বাদ")
                 continue
             seen_ids.add(uid)
         uploaders.append(u)
@@ -2078,6 +2085,10 @@ def link_panel_text(job):
             wmb_txt = f" | 📦 `{wmb} MB`" if wmb else ""
             lines.append(f"{w['icon']} `{safe(w['label'])}` — ✅ 🎬`{w['v']}` 🖼️`{w['p']}`")
             lines.append(f"   {'🟢' if w['busy'] else '⚪'} {w['action']}{wmb_txt}")
+        if "tele_total" in job:
+            lines.append(f"🔌 Variables থেকে Telethon সেশন লোড: `{job['tele_total']}`টি | সক্রিয়: `{len(ws)}`টি")
+        for sk in (job.get("skipped") or []):
+            lines.append(f"⚠️ `{safe(sk)[:110]}`")
 
     if pending:
         lines.append("")
@@ -2490,6 +2501,8 @@ async def process_link_queue(client, user_id, job):
         assign_roles(uploaders)
         job["engine"] = engine_text(uploaders)
         job["workers"] = {u_["name"]: new_worker_state(u_) for u_ in uploaders}
+        job["skipped"] = list(skipped_uploaders)
+        job["tele_total"] = len(telethon_clients)
 
         seq = 0
         while True:
