@@ -2591,4 +2591,69 @@ async def process_link_queue(client, user_id, job):
         summary += f"\n```text\n{shown}\n```"
     await update_panel(client, user_id, summary[:4000], end_kb)
 
-# ================= Web Service Port Binding (Railway/Render) ====
+# ================= Web Service Port Binding (Railway/Render) =================
+web_app = Flask(__name__)
+
+@web_app.route("/")
+def home():
+    return f"Modular Scraper Bot is Running! Loaded sites: {len(loaded_sites)} | Max albums/scan: {MAX_ALBUMS_PER_SCAN}"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host="0.0.0.0", port=port)
+
+async def main():
+    global backup_event, startup_db_status
+    await bot.start()
+    try:
+        status = await restore_db_from_telegram()
+    except Exception as e:
+        status = f"Restore error: {e}"
+    startup_db_status = status
+    print(f"💾 {status}")
+    # রিস্টোরের জন্য Telethon খুললে সেটা বন্ধ করে দিই (শুধু দরকারে কানেক্ট হবে)
+    await release_telethon()
+
+    for i, pc in enumerate(pyro_clients, start=1):
+        try:
+            await pc.start()
+            me = await pc.get_me()
+            try:
+                await pc.get_chat(STORAGE_CHANNEL_ID)
+            except Exception:
+                async for _d in pc.get_dialogs():
+                    pass
+                await pc.get_chat(STORAGE_CHANNEL_ID)
+            pyro_ready.append((f"Account {i}", pc))
+            print(f"👤 Uploader Account {i} ready: {me.first_name} ({me.id})")
+        except Exception as e:
+            print(f"⚠️ Uploader Account {i} failed to start: {type(e).__name__}: {e}")
+
+    backup_event = asyncio.Event()
+    worker = asyncio.create_task(backup_worker())
+    print(f"🤖 Bot is running. Loaded {len(loaded_sites)} site modules. "
+          f"Pyrogram uploader accounts: {len(pyro_ready)} | Telethon accounts: {len(telethon_clients)}")
+    print(f"📌 MAX_ALBUMS_PER_SCAN = {MAX_ALBUMS_PER_SCAN} | DEFAULT_HASHTAG = {DEFAULT_HASHTAG} | MAX_LINKS_QUEUE = {MAX_LINKS_QUEUE} | ORDERED_PARTS = {ORDERED_PARTS}")
+    print(f"🎛️ ROLE_SPLIT = {ROLE_SPLIT} | USE_PYRO_UPLOADERS = {USE_PYRO_UPLOADERS}")
+
+    await idle()
+
+    worker.cancel()
+    if backup_dirty:
+        await do_backup()
+    for c in telethon_clients:
+        try:
+            if c.is_connected():
+                await c.disconnect()
+        except Exception:
+            pass
+    for _n, pc in pyro_ready:
+        try:
+            await pc.stop()
+        except Exception:
+            pass
+    await bot.stop()
+
+if __name__ == "__main__":
+    Thread(target=run_flask, daemon=True).start()
+    asyncio.get_event_loop().run_until_complete(main())
