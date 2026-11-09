@@ -2349,6 +2349,7 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
                 downloaded_files.append(r["file"])
             else:
                 a_fail += 1
+                job.setdefault("errors", []).append(r.get("err", "Unknown error"))
 
         groups, cur, cur_bytes = [], [], 0
         for f in downloaded_files:
@@ -2387,6 +2388,7 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
             w["v"] += v
             w["p"] += p
             a_fail += len(errs)
+            job.setdefault("errors", []).extend(errs)
             await refresh_link_panel(client, user_id, job, force=True)
             await cancellable_sleep(1, state)
 
@@ -2417,6 +2419,9 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
                 raise
             except Exception as ce:
                 a_fail += len(ch)
+                job.setdefault("errors", []).append(
+                    f"• [Link {seq} {lane} Part {ci + 1} Crashed ({uploader['name']})]\n  Reason: {type(ce).__name__}: {ce}"
+                )
                 set_action(wname, f"❌ Part {ci + 1} ব্যর্থ: {type(ce).__name__}", busy=False)
                 print(f"⚠️ Link {seq} {lane} part {ci + 1} crashed ({uploader['name']}): {type(ce).__name__}: {ce}")
             finally:
@@ -2589,6 +2594,12 @@ async def process_link_queue(client, user_id, job):
         if len(job["results"]) > 8:
             shown = f"...আগের {len(job['results']) - 8}টি বাদ\n" + shown
         summary += f"\n```text\n{shown}\n```"
+    job_errs = job.get("errors") or []
+    if job_errs:
+        err_shown = "\n".join(e[:220] for e in job_errs[:4])
+        if len(job_errs) > 4:
+            err_shown += f"\n...আরও {len(job_errs) - 4}টি ত্রুটি"
+        summary += f"\n⚠️ **ব্যর্থতার কারণ:**\n```text\n{err_shown}\n```"
     await update_panel(client, user_id, summary[:4000], end_kb)
 
 # ================= Web Service Port Binding (Railway/Render) =================
