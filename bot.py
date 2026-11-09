@@ -16,11 +16,10 @@ from datetime import datetime, timezone
 from threading import Thread
 from flask import Flask
 
-# ================= Python 3.14 Event Loop Fix =================
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+# ================= Event Loop Fix (Python 3.10 - 3.14) =================
+# Pyrogram/Pyrofork ইমপোর্ট ও Client তৈরির আগেই একটা loop বানিয়ে সেট করতে হবে।
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 from pyrogram import Client, filters, idle, enums
 from pyrogram.types import (
@@ -59,7 +58,7 @@ except ImportError:
 API_ID = int(os.environ.get("API_ID", "123456"))
 API_HASH = os.environ.get("API_HASH", "your_api_hash")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
-STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", "-100123456789"))
+STORAGE_CHANNEL_ID = int(os.environ.get("STORAGE_CHANNEL_ID", "-1004492974143"))
 TELETHON_SESSION_STRING = os.environ.get("TELETHON_SESSION_STRING", "").strip()
 
 # ---- একাধিক অ্যাকাউন্ট ----
@@ -102,11 +101,10 @@ def _collect_pyro_sessions():
 
 DOWNLOAD_PARALLEL = max(1, int(os.environ.get("DOWNLOAD_PARALLEL", "5")))
 SITES_DIR = "sites"
-DB_PATH = os.environ.get("DB_PATH", "scraped_data.db")   # Railway Volume থাকলে যেমন /data/scraped_data.db
+DB_PATH = os.environ.get("DB_PATH", "scraped_data.db")
 _db_dir = os.path.dirname(DB_PATH)
 if _db_dir:
     os.makedirs(_db_dir, exist_ok=True)
-# BACKUP_CHANNEL_ID না দিলে স্টোরেজ চ্যানেলেই ব্যাকআপ যাবে (বট ওখানে অ্যাডমিন আছে)
 BACKUP_CHANNEL_ID = int(os.environ.get("BACKUP_CHANNEL_ID") or STORAGE_CHANNEL_ID)
 BACKUP_TAG = "#DB_BACKUP"
 SITE_PREFIX = "🌐 "
@@ -116,29 +114,25 @@ MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_MB", "2000")) * 1024 * 1024
 MAX_BATCH_BYTES = int(os.environ.get("MAX_BATCH_MB", "2000")) * 1024 * 1024
 
 # ========== নতুন সেটিংস ==========
-MAX_ALBUMS_PER_SCAN = 20          # প্রতি স্ক্যানে সর্বোচ্চ কয়টা অ্যালবাম
-DEFAULT_HASHTAG = "#newweb"       # ডিফল্ট হ্যাশট্যাগ
-# অ্যালবামে শুধু প্রথম ফাইলে ক্যাপশন (টাইটেল + নিচে হ্যাশট্যাগ) থাকবে, যাতে টেলিগ্রাম অ্যালবামের নিচে ক্যাপশন দেখায়
+MAX_ALBUMS_PER_SCAN = int(os.environ.get("MAX_ALBUMS_PER_SCAN", "100"))
+DEFAULT_HASHTAG = "#reels"
 REST_CAPTION_HASHTAG = os.environ.get("REST_CAPTION_HASHTAG", "0") == "1"
-# প্রতি অ্যালবাম শেষে চ্যানেলে আলাদা "completed" রিপোর্ট মেসেজ (ডিফল্ট বন্ধ)
 ALBUM_REPORT_IN_CHANNEL = os.environ.get("ALBUM_REPORT_IN_CHANNEL", "0") == "1"
 ORDERED_ALBUMS = os.environ.get("ORDERED_ALBUMS", "1") == "1"
-RESOLVE_PARALLEL = max(1, int(os.environ.get("RESOLVE_PARALLEL", "3")))   # একসাথে কয়টা অ্যালবামের পেজ খুলবে
+RESOLVE_PARALLEL = max(1, int(os.environ.get("RESOLVE_PARALLEL", "3")))
 
 # ========== Send Link ফিচারের সেটিংস ==========
-MAX_LINKS_QUEUE = 10              # একসাথে সর্বোচ্চ কয়টা লিংক কিউতে থাকতে পারবে (অ্যালবামের ফাইল সংখ্যার কোনো লিমিট নেই)
-# Send Link-এ একটি অ্যালবামের অংশগুলো (১০ ফাইলের গ্রুপ) একাধিক আইডিতে ভাগ হলে চ্যানেলে ক্রম ঠিক রাখবে কিনা
-# 1 = ক্রমানুসারে আপলোড (ডাউনলোড সমান্তরালে হয়), 0 = যে অংশ আগে তৈরি সেটা আগে যাবে (দ্রুততম)
+MAX_LINKS_QUEUE = 10
 ORDERED_PARTS = os.environ.get("ORDERED_PARTS", "1") == "1"
-
-# ========== নতুন: ভূমিকা-ভিত্তিক আপলোড (Telethon x3) ==========
-# 1 = প্রথম আইডি শুধু ছবি ডাউনলোড/আপলোড করবে, বাকি আইডিগুলো শুধু ভিডিও (ভিডিও সমান ভাগে ভাগ হবে)।
-#     নিজের কাজ শেষ হলে বসে না থেকে অন্যজনের বাকি অংশ নিয়ে সাহায্য করবে।
-# 0 = আগের মতো মিশ্র অংশে ভাগ (যে আইডি আগে ফ্রি সে পরের অংশ নেবে)
 ROLE_SPLIT = os.environ.get("ROLE_SPLIT", "1") == "1"
-# 0 = Telethon সেশন থাকলে শুধু Telethon দিয়েই আপলোড (Pyrogram ইউজার আইডি আপলোডারে ধরা হবে না)
-# 1 = Pyrogram ইউজার আইডিও আপলোডারের তালিকায় যুক্ত হবে
 USE_PYRO_UPLOADERS = os.environ.get("USE_PYRO_UPLOADERS", "0") == "1"
+
+DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
 
 bot = Client("html_scraper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -156,11 +150,11 @@ if TELETHON_AVAILABLE:
         telethon_clients.append(TelegramClient(StringSession(_sess), API_ID, API_HASH))
 
 # ---- Telethon সেশন স্টেট ট্র্যাকিং ----
-dead_telethon = {}      # id(client) -> কারণ (AuthKeyDuplicated ইত্যাদি হলে এখানে যাবে)
-connect_locks = {}      # id(client) -> asyncio.Lock (একসাথে দুইবার connect ঠেকাতে)
-primed_clients = set()  # যেসব ক্লায়েন্টের চ্যানেল entity লোড হয়েছে
-backup_primed_pyro = set()      # যেসব Pyrogram ইউজার ক্লায়েন্ট ব্যাকআপ চ্যানেল চিনেছে
-backup_primed_telethon = set()  # যেসব Telethon ক্লায়েন্ট ব্যাকআপ চ্যানেল চিনেছে
+dead_telethon = {}
+connect_locks = {}
+primed_clients = set()
+backup_primed_pyro = set()
+backup_primed_telethon = set()
 
 def mark_telethon_dead(c, reason):
     if id(c) not in dead_telethon:
@@ -256,7 +250,6 @@ def _make_snapshot():
     return snap
 
 async def _prime_pyro_backup_channel(pc):
-    """Pyrogram ইউজার সেশনকে ব্যাকআপ চ্যানেল চিনিয়ে নেয় (in_memory সেশনে cache থাকে না)"""
     if id(pc) in backup_primed_pyro:
         return True
     try:
@@ -276,7 +269,6 @@ async def _prime_pyro_backup_channel(pc):
         return False
 
 async def _prime_telethon_backup_channel(tc):
-    """Telethon সেশনকে ব্যাকআপ চ্যানেল চিনিয়ে নেয়"""
     if id(tc) in backup_primed_telethon:
         return True
     try:
@@ -323,7 +315,6 @@ async def do_backup():
         sender_obj = None
         errs = []
 
-        # ১) আগে বট টোকেন দিয়ে চেষ্টা
         try:
             msg = await bot.send_document(
                 BACKUP_CHANNEL_ID,
@@ -338,7 +329,6 @@ async def do_backup():
             errs.append(f"Bot: {type(bot_err).__name__}: {bot_err}")
             print(f"⚠️ Bot backup failed ({bot_err}) - ইউজার আইডি দিয়ে চেষ্টা করা হচ্ছে...")
 
-        # ২) বট ব্যর্থ হলে Pyrogram ইউজার আইডি দিয়ে
         if new_id is None:
             for _n, pc in pyro_ready:
                 try:
@@ -359,7 +349,6 @@ async def do_backup():
                     errs.append(f"{_n}: {type(e).__name__}: {e}")
                     print(f"⚠️ Pyrogram user backup failed: {e}")
 
-        # ৩) তাতেও না হলে Telethon দিয়ে
         if new_id is None and TELETHON_AVAILABLE:
             tc = None
             try:
@@ -389,7 +378,6 @@ async def do_backup():
         if new_id is None:
             raise RuntimeError("কোনো আইডি দিয়েই ব্যাকআপ পাঠানো যায়নি | " + " | ".join(errs)[:350])
 
-        # পিন করা
         try:
             if sender_kind == "bot":
                 await bot.pin_chat_message(BACKUP_CHANNEL_ID, new_id, disable_notification=True)
@@ -400,7 +388,6 @@ async def do_backup():
         except Exception as pin_err:
             print(f"⚠️ Backup pin failed: {pin_err}")
 
-        # আগের ব্যাকআপ মেসেজ মুছে ফেলা
         old_id = last_backup_msg_id
         last_backup_msg_id = new_id
         if old_id and old_id != new_id:
@@ -501,7 +488,6 @@ def mark_as_uploaded(url, hashtag):
     schedule_backup()
 
 def make_album_key(site_key, title, first_url=None):
-    """অ্যালবামকে ইউনিকভাবে চিনতে (v2: আগের ভুল থাম্বনেইল-স্ক্যানের রেকর্ড এড়াতে)"""
     base = f"{site_key}|v2|{(title or '').strip().lower()[:120]}"
     if first_url:
         base += f"|{first_url}"
@@ -603,7 +589,7 @@ def get_site_albums(site, override_html=None):
             seen.add(url)
             items.append((kind, url))
         if items or a.get("needs_resolve"):
-            entry = dict(a)   # url, needs_resolve ইত্যাদি এক্সট্রা ফিল্ড রেখে দিই
+            entry = dict(a)
             entry["title"] = a.get("title") or f"Album {idx}"
             entry["items"] = items
             clean_albums.append(entry)
@@ -614,7 +600,7 @@ discover_sites()
 # ================= ইউজার সেশন ও বাটন =================
 user_sessions = {}
 active_scans = {}
-link_jobs = {}          # user_id -> Send Link কিউ জব
+link_jobs = {}
 
 def link_job_running(user_id):
     job = link_jobs.get(user_id)
@@ -642,8 +628,16 @@ async def run_cancellable(coro, state):
 
 def get_home_keyboard():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎥 RedReels Menu", callback_data="action_redreels_menu")],
         [InlineKeyboardButton("🔄 Reload Site Files", callback_data="action_reload_sites")],
-        [InlineKeyboardButton("🔄 Sync Storage Channel (Telethon)", callback_data="action_sync_channel")]
+        [InlineKeyboardButton("🔄 Sync Storage Channel", callback_data="action_sync_channel")]
+    ])
+
+def get_redreels_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Send HTML Files (4-5 Max)", callback_data="action_redreels_html")],
+        [InlineKeyboardButton("🚀 Start Infinite Scan (100/scan)", callback_data="action_redreels_scan")],
+        [InlineKeyboardButton("🏠 Home", callback_data="menu_home")]
     ])
 
 def get_site_keyboard(site_key):
@@ -729,7 +723,6 @@ async def reset_panel(client, user_id):
 
 # ================= Telethon কানেকশন ম্যানেজমেন্ট =================
 async def prime_entity(c):
-    """নতুন StringSession-এ চ্যানেলের entity cache থাকে না, তাই আগে লোড করে নিই"""
     try:
         await c.get_entity(STORAGE_CHANNEL_ID)
         return
@@ -757,7 +750,6 @@ async def ensure_telethon_connected(tclient=None):
     if id(target) in dead_telethon:
         return False, dead_telethon[id(target)]
 
-    # ইতিমধ্যে ভেরিফাইড ও কানেক্টেড হলে আর নেটওয়ার্ক কল নয়
     if target.is_connected() and id(target) in primed_clients:
         return True, "Connected"
 
@@ -785,7 +777,6 @@ async def ensure_telethon_connected(tclient=None):
             return False, f"{type(e).__name__}: {str(e)}"
 
 async def release_telethon():
-    """স্ক্যান/লিংক কিউ না চললে Telethon কানেকশন বন্ধ রাখি (Railway overlap-এ সেশন ক্লাশ কমাতে)"""
     if active_scans or any_link_running():
         return
     for c in telethon_clients:
@@ -976,6 +967,45 @@ async def handle_callbacks(client, cq):
                 get_home_keyboard()
             )
 
+        elif data == "action_redreels_menu":
+            sess["state"] = "IDLE"
+            await safe_answer(cq)
+            await update_panel(
+                client, user_id,
+                f"🎥 **RedReels Scanner Menu**\n\n"
+                f"• আপনার অনুমোদিত ওয়েবসাইটের HTML ফাইল আপলোড করুন।\n"
+                f"• প্রতি স্ক্যানে ১০০টি করে ভিডিও স্ক্যান হবে।\n"
+                f"• কাজ শেষ হলে আবার স্ক্যান করলে ঠিক তারপর থেকে শুরু হবে।\n"
+                f"• ডুপ্লিকেট আপলোড আটকাতে ৩টি সেশন আইডি প্যারালালি কাজ করবে।\n\n"
+                f"নিচের অপশনগুলো ব্যবহার করুন:",
+                get_redreels_keyboard()
+            )
+
+        elif data == "action_redreels_html":
+            sess["state"] = "WAITING_REDREELS_HTML"
+            await safe_answer(cq)
+            await update_panel(
+                client, user_id,
+                f"📄 **RedReels HTML Upload**\n\n"
+                f"• সর্বোচ্চ ৪-৫টি `.html` ফাইল একবারে বা এক এক করে পাঠাতে পারেন।\n"
+                f"• ফাইলগুলোতে 'Trending' বা 'GIFs' সেকশনের কোড থাকতে হবে।\n\n"
+                f"এখন ফাইলগুলো পাঠান 👇",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to RedReels", callback_data="action_redreels_menu")]])
+            )
+
+        elif data == "action_redreels_scan":
+            await safe_answer(cq, "Starting Infinite Scan for RedReels...")
+
+            site = loaded_sites.get("redreels")
+            if not site:
+                await update_panel(client, user_id, "⚠️ **RedReels Site Module Not Found!**\nPlease ensure `redreels.py` is in the `sites/` folder.", get_redreels_keyboard())
+                return
+
+            override = sess.get("custom_html", {}).get("redreels") or db_get_site_html("redreels")
+            started = await start_scan(client, user_id, site, override)
+            if not started:
+                await update_panel(client, user_id, "⚠️ একটি স্ক্যান ইতিমধ্যে চলছে। আগে সেটা শেষ করুন অথবা ক্যানসেল করুন।", get_redreels_keyboard())
+
         elif data == "action_sync_channel":
             await safe_answer(cq, "Syncing storage channel via Telethon...")
             t_ok, t_err = await ensure_telethon_connected()
@@ -1097,14 +1127,12 @@ async def handle_text(client, message):
     text = (message.text or "").strip()
     sess = user_sessions.setdefault(user_id, {"state": "IDLE", "custom_html": {}})
 
-    # Reply keyboard থেকে সাইট সিলেক্ট
     if text.startswith(SITE_PREFIX):
         site = find_site_by_label(text)
         if site:
             await show_site_panel(client, user_id, site)
             return
 
-    # লিংক পাঠানো হলে (Send Link ফিচার)
     if sess.get("state") == "WAITING_LINK":
         site_key = sess.get("active_site_key")
         site = loaded_sites.get(site_key)
@@ -1132,11 +1160,9 @@ async def handle_text(client, message):
 
         job = result["job"]
         if not result["new_job"]:
-            # চলমান জবে লিংক যোগ হয়েছে (বা বাদ পড়েছে) - প্যানেল রিফ্রেশ
             await refresh_link_panel(client, user_id, job, force=True)
         return
 
-    # HTML পেস্ট করা হলে
     if sess.get("state") == "WAITING_HTML":
         site_key = sess.get("active_site_key")
         site = loaded_sites.get(site_key)
@@ -1153,11 +1179,54 @@ async def handle_text(client, message):
             return
         else:
             await message.reply("⚠️ এটা HTML কোড মনে হচ্ছে না। সম্পূর্ণ HTML পেস্ট করুন বা `.html` ফাইল পাঠান।")
+            return
+
+    if sess.get("state") == "WAITING_REDREELS_HTML":
+        looks_like_html = bool(re.search(r"<\s*(!doctype|html|body|div|a\s|img|video|source)", text, re.I))
+        if text and looks_like_html:
+            save_site_html("redreels", text)
+            sess.setdefault("custom_html", {})["redreels"] = text
+            sess["state"] = "IDLE"
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await update_panel(client, user_id, "✅ **RedReels HTML Saved Successfully!**\nNow you can start the scan.", get_redreels_keyboard())
+            return
+        else:
+            await message.reply("⚠️ এটা HTML কোড মনে হচ্ছে না। সম্পূর্ণ HTML পেস্ট করুন বা `.html` ফাইল পাঠান।")
+            return
 
 @bot.on_message(filters.private & filters.document)
 async def handle_document(client, message):
     user_id = message.from_user.id
     sess = user_sessions.setdefault(user_id, {"state": "IDLE", "custom_html": {}})
+
+    if sess.get("state") == "WAITING_REDREELS_HTML":
+        doc = message.document
+        if not (doc.file_name or "").lower().endswith((".html", ".htm", ".txt")):
+            await message.reply("শুধু `.html` বা `.txt` ফাইল সাপোর্ট করে।")
+            return
+
+        path = await message.download()
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                html_content = f.read()
+
+            # আগের সেভ করা HTML (মেমরি বা ডাটাবেস) + নতুন ফাইল
+            existing_html = sess.setdefault("custom_html", {}).get("redreels") or db_get_site_html("redreels") or ""
+            combined_html = existing_html + "\n" + html_content
+
+            save_site_html("redreels", combined_html)
+            sess["custom_html"]["redreels"] = combined_html
+            file_count = max(1, combined_html.lower().count("<!doctype html"))
+            await update_panel(client, user_id, f"✅ **RedReels HTML File Saved!**\nTotal combined files: {file_count}", get_redreels_keyboard())
+
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+        return
+
     if sess.get("state") != "WAITING_HTML":
         return
 
@@ -1192,7 +1261,6 @@ def url_ext(url, kind="video"):
     return ".mp4" if kind == "video" else ".jpg"
 
 def looks_like_bad_download(path):
-    """ডাউনলোড হওয়া ফাইল আসলে HTML/JSON এরর পেজ কিনা (MEDIA_EMPTY এড়াতে)"""
     try:
         with open(path, "rb") as f:
             head = f.read(64).lstrip().lower()
@@ -1204,7 +1272,6 @@ def looks_like_bad_download(path):
         return False
 
 async def download_file_with_details(url, dest_path, site_mod, state, progress_cb=None, max_bytes=None):
-    # সাইট মডিউলে custom_download থাকলে সেটা ব্যবহার করবে
     if hasattr(site_mod, "custom_download"):
         ok, err = await site_mod.custom_download(url, dest_path, state, progress_cb, max_bytes)
         if not ok and err == "__CANCELLED__":
@@ -1215,7 +1282,7 @@ async def download_file_with_details(url, dest_path, site_mod, state, progress_c
     for attempt in range(1, 4):
         try:
             check_cancel(state)
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(headers=DOWNLOAD_HEADERS) as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
                     if resp.status != 200:
                         return False, f"HTTP {resp.status}"
@@ -1251,7 +1318,9 @@ async def download_file_with_details(url, dest_path, site_mod, state, progress_c
 def build_caption(title, a_idx, total_albums, part, multi_part, hashtag):
     single_tag = "#" + hashtag.lstrip("#").split()[0] if hashtag else DEFAULT_HASHTAG
     tag_html = htmllib.escape(single_tag)
-    clean_title = re.sub(r"#\S+", "", title or "").strip()
+
+    clean_title = ""
+
     if clean_title:
         first = f"<b>{htmllib.escape(clean_title[:200])}</b>\n\n{tag_html}"
     else:
@@ -1316,7 +1385,6 @@ async def send_album(files, caption, uploader=None):
             await _send_via_telethon(tclient, files, paths, first_cap, rest_cap)
             return
         except AuthKeyDuplicatedError:
-            # সেশন স্থায়ীভাবে অকেজো - মার্ক করে বট টোকেন দিয়ে পাঠাই
             mark_telethon_dead(tclient, "AuthKeyDuplicatedError: একই session দুই IP-তে ব্যবহার হয়েছে।")
             try:
                 await tclient.disconnect()
@@ -1417,18 +1485,22 @@ async def start_scan(client, user_id, site, override_html=None):
     return True
 
 # ================= আপলোডার তালিকা ও ভূমিকা (Role) =================
+skipped_uploaders = []
+
 def _uploader_label(name, first_name):
     fn = (first_name or "").strip()
     return f"{name} ({fn[:14]})" if fn else name
 
 async def build_uploaders():
-    # ১) Telethon আপলোডার (সবগুলো জীবিত সেশন)
+    skipped_uploaders.clear()
     tele = []
     for i, c in enumerate(telethon_clients, start=1):
         if id(c) in dead_telethon:
+            skipped_uploaders.append(f"Telethon {i}: অকেজো ({str(dead_telethon.get(id(c)))[:70]})")
             continue
-        ok, _ = await ensure_telethon_connected(c)
+        ok, why = await ensure_telethon_connected(c)
         if not ok:
+            skipped_uploaders.append(f"Telethon {i}: কানেক্ট হয়নি ({str(why)[:70]})")
             continue
         uid = None
         fn = ""
@@ -1438,6 +1510,7 @@ async def build_uploaders():
             fn = me.first_name or ""
         except AuthKeyDuplicatedError:
             mark_telethon_dead(c, "AuthKeyDuplicatedError")
+            skipped_uploaders.append(f"Telethon {i}: AuthKeyDuplicatedError (সেশন অকেজো)")
             continue
         except Exception:
             pass
@@ -1447,7 +1520,6 @@ async def build_uploaders():
             "label": _uploader_label(name, fn), "uid": uid
         })
 
-    # ২) Pyrogram ইউজার আপলোডার (শুধু USE_PYRO_UPLOADERS=1 হলে, অথবা Telethon একদম না থাকলে)
     pyro = []
     if USE_PYRO_UPLOADERS or not tele:
         for name, c in pyro_ready:
@@ -1466,10 +1538,11 @@ async def build_uploaders():
 
     uploaders = []
     seen_ids = set()
-    for u in pyro + tele:
+    for u in tele + pyro:
         uid = u.get("uid")
         if uid is not None:
             if uid in seen_ids:
+                skipped_uploaders.append(f"{u['name']}: একই অ্যাকাউন্ট ({u.get('label')}) আগেই আছে, তাই বাদ")
                 continue
             seen_ids.add(uid)
         uploaders.append(u)
@@ -1479,7 +1552,6 @@ async def build_uploaders():
     return uploaders
 
 def assign_roles(uploaders):
-    """প্রথম আইডি = ছবি, বাকিরা = ভিডিও। একটাই আইডি থাকলে/ROLE_SPLIT বন্ধ থাকলে সবাই 'both'"""
     n = len(uploaders)
     for i, u in enumerate(uploaders):
         if not ROLE_SPLIT or n == 1:
@@ -1525,8 +1597,8 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         state = {"cancel": False}
     site_key = site["key"]
     site_mod = site["module"]
-    hashtag = DEFAULT_HASHTAG   # জোর করে #newweb ব্যবহার
-    end_kb = get_site_keyboard(site_key)
+    hashtag = DEFAULT_HASHTAG
+    end_kb = get_redreels_keyboard() if site_key == "redreels" else get_site_keyboard(site_key)
     cancel_kb = get_cancel_keyboard()
 
     up_v = up_p = skipped = albums_done = 0
@@ -1576,7 +1648,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             pass
 
     try:
-        # ========== লিস্ট পেজ নিজে থেকে সাইট থেকে আনা (SITE_LIST_URLS সেট থাকলে) ==========
         fetch_fn = getattr(site_mod, "fetch_html_content", None)
         if fetch_fn:
             await update_panel(client, user_id, "🌐 **সাইট থেকে লিস্ট পেজ আনা হচ্ছে...**", cancel_kb)
@@ -1601,7 +1672,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         await update_panel(client, user_id, f"🔍 **Running parser `{site['path']}`...**", cancel_kb)
         title, albums = get_site_albums(site, override_html)
 
-        # ========== শুধুমাত্র নতুন অ্যালবাম ফিল্টার ==========
         new_albums = []
         for album in albums:
             items = album.get("items") or []
@@ -1614,8 +1684,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             if is_album_processed(akey):
                 continue
 
-            # সব মিডিয়া আগে থেকেই আপলোড আছে কিনা
-            # (needs_resolve অ্যালবামে এখন শুধু থাম্বনেইল আছে, তাই আসল মিডিয়া আনার পরে চেক হবে)
             if not album.get("needs_resolve") and all(is_duplicate(url) for _, url in items):
                 mark_album_processed(akey, site_key, album.get("title"))
                 continue
@@ -1638,7 +1706,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             )
             return
 
-        # ========== অ্যালবামের ভেতরের আসল ফটো/ভিডিও বের করা ==========
         resolve_fn = getattr(site_mod, "resolve_album", None)
         if resolve_fn:
             to_resolve = [a for a in albums if a.get("needs_resolve")]
@@ -1722,7 +1789,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
         else:
             uploader_mode = f"{len(uploaders)} User Accounts (Album-level parallel)"
 
-        # জব কিউ তৈরি
         seen_run = set()
         queue = asyncio.Queue()
         prev_done = None
@@ -1747,7 +1813,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                 items.append((kind, url))
 
             if not items:
-                # পুরো অ্যালবাম আগেই আপলোড → মার্ক করে দিই
                 akey = album.get("_akey") or album_key_of(site_key, album)
                 mark_album_processed(akey, site_key, album.get("title"))
                 continue
@@ -1872,7 +1937,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                     except Exception:
                         pass
 
-            # অ্যালবাম কমপ্লিট রিপোর্ট
             report = (
                 f"✅ <b>Album {a_idx}/{total_albums} completed</b>\n"
                 f"📁 {htmllib.escape(album['title'][:200])}\n"
@@ -1885,8 +1949,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
             if ALBUM_REPORT_IN_CHANNEL:
                 await send_channel_text(report)
 
-            # শুধু সম্পূর্ণ সফল হলে অ্যালবাম "প্রসেসড" মার্ক হবে
-            # (ফেইল হলে পরের স্ক্যানে আবার চেষ্টা হবে, আপলোড হওয়া ফাইল ডুপ্লিকেট হিসেবে স্কিপ হবে)
             if a_fail == 0:
                 akey = album.get("_akey") or album_key_of(site_key, album)
                 mark_album_processed(akey, site_key, album.get("title"))
@@ -1952,7 +2014,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
                 pass
         if active_scans.get(user_id) is state:
             active_scans.pop(user_id, None)
-        # স্ক্যান শেষ: Telethon কানেকশন বন্ধ
         try:
             await release_telethon()
         except Exception:
@@ -1985,14 +2046,6 @@ async def process_and_upload(client, user_id, site, override_html=None, state=No
 
     await update_panel(client, user_id, summary_text[:4000], end_kb)
 
-# ================= 🔗 SEND LINK ফিচার =================
-# ইউজার অ্যালবামের লিংক পাঠায় → বট সেই অ্যালবামের সব ফটো/ভিডিও স্টোরেজ চ্যানেলে আপলোড করে
-# (ক্যাপশন + নিচে #newweb) → শেষে চ্যানেলে "Album completed" মেসেজ।
-# একসাথে সর্বোচ্চ MAX_LINKS_QUEUE টা লিংক কিউতে থাকে; একটা শেষ হলে পরেরটা শুরু হয়।
-# অ্যালবামের ফাইল সংখ্যার কোনো লিমিট নেই।
-# ভূমিকা-ভিত্তিক ভাগ (ROLE_SPLIT=1): প্রথম আইডি শুধু ছবি, বাকি আইডিগুলো শুধু ভিডিও।
-# কাজ শেষ হলে যে আইডি ফ্রি হয় সে অন্য লেনের বাকি অংশ নিয়ে সাহায্য করে (🤝)।
-
 def extract_links(text):
     found = []
     for m in re.findall(r'https?://[^\s<>"\']+', text or ""):
@@ -2009,7 +2062,6 @@ def title_from_url(url):
     return t[:120] or "Album"
 
 async def fetch_link_title(site_mod, url):
-    """অ্যালবামের পেজ থেকে টাইটেল আনে (সাইট মডিউলে fetch_album_title(url) থাকলে সেটাই ব্যবহার হবে)"""
     fn = getattr(site_mod, "fetch_album_title", None)
     if fn:
         try:
@@ -2067,7 +2119,6 @@ def link_panel_text(job):
         lines.append(f"▶️ **চলছে:** `{cur['seq']}/{job['total']}` `{shown}`")
         lines.append(f"   {job.get('action', '')}{mb_txt}")
 
-    # ===== প্রতিটা আইডি এখন কী করছে =====
     ws = job.get("workers") or {}
     if ws:
         busy_n = sum(1 for w in ws.values() if w.get("busy"))
@@ -2078,6 +2129,10 @@ def link_panel_text(job):
             wmb_txt = f" | 📦 `{wmb} MB`" if wmb else ""
             lines.append(f"{w['icon']} `{safe(w['label'])}` — ✅ 🎬`{w['v']}` 🖼️`{w['p']}`")
             lines.append(f"   {'🟢' if w['busy'] else '⚪'} {w['action']}{wmb_txt}")
+        if "tele_total" in job:
+            lines.append(f"🔌 Variables থেকে Telethon সেশন লোড: `{job['tele_total']}`টি | সক্রিয়: `{len(ws)}`টি")
+        for sk in (job.get("skipped") or []):
+            lines.append(f"⚠️ `{safe(sk)[:110]}`")
 
     if pending:
         lines.append("")
@@ -2107,7 +2162,6 @@ async def refresh_link_panel(client, user_id, job, force=False):
         pass
 
 async def enqueue_links(client, user_id, site, links):
-    """লিংকগুলো কিউতে যোগ করে; জব না চললে নতুন জব শুরু করে"""
     old_scan = active_scans.get(user_id)
     if old_scan and not old_scan["task"].done():
         return {"status": "scan_running"}
@@ -2219,7 +2273,6 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
     n_workers = max(1, len(uploaders))
     sem = asyncio.Semaphore(DOWNLOAD_PARALLEL * n_workers)
 
-    # প্রতিটা আইডির লাইভ স্ট্যাটাস (প্যানেলে দেখানোর জন্য)
     workers = job.get("workers")
     if workers is None:
         workers = job["workers"] = {}
@@ -2237,8 +2290,6 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
         if busy is not None:
             w_["busy"] = busy
 
-    # ===== অংশ (part) তৈরি: লেন অনুযায়ী =====
-    # split_mode: 'photo' লেন (ছবি) + 'video' লেন (ভিডিও); নাহলে একটাই 'mixed' লেন (আগের মতো)
     indexed = [(i + 1, kind, uu) for i, (kind, uu) in enumerate(items)]
 
     def _chunks(lst, size):
@@ -2256,7 +2307,6 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
         if photos:
             lane_lists["photo"] = _chunks(photos, MAX_ALBUM_BATCH)
         if videos:
-            # ভিডিওগুলো ভিডিও-আইডিদের মধ্যে সমান ভাগে ভাগ (সর্বোচ্চ ১০টা করে অংশ)
             vsize = max(1, min(MAX_ALBUM_BATCH, -(-len(videos) // n_vw)))
             lane_lists["video"] = _chunks(videos, vsize)
     else:
@@ -2277,7 +2327,6 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
     lane_icons = {"photo": "🖼️", "video": "🎬", "mixed": "📦"}
 
     def lane_pref(uploader):
-        """আইডি আগে নিজের লেন থেকে কাজ নেবে, খালি হলে অন্য লেন থেকে সাহায্য করবে"""
         if "mixed" in lane_q:
             return ["mixed"]
         order = ["photo", "video"] if uploader.get("role") == "photo" else ["video", "photo"]
@@ -2349,6 +2398,7 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
                 downloaded_files.append(r["file"])
             else:
                 a_fail += 1
+                job.setdefault("errors", []).append(r.get("err", "Unknown error"))
 
         groups, cur, cur_bytes = [], [], 0
         for f in downloaded_files:
@@ -2364,7 +2414,6 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
         for g in groups:
             check_cancel(state)
 
-            # ক্রম ঠিক রাখতে একই লেনের আগের অংশ আপলোড শেষ না হওয়া পর্যন্ত অপেক্ষা
             if ORDERED_PARTS and ci > 0 and not waited:
                 set_action(wname, f"⏳ আগের অংশের আপলোডের জন্য অপেক্ষা... ({part_txt}){help_mark}", busy=True)
                 await refresh_link_panel(client, user_id, job, force=True)
@@ -2387,6 +2436,7 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
             w["v"] += v
             w["p"] += p
             a_fail += len(errs)
+            job.setdefault("errors", []).extend(errs)
             await refresh_link_panel(client, user_id, job, force=True)
             await cancellable_sleep(1, state)
 
@@ -2417,6 +2467,9 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
                 raise
             except Exception as ce:
                 a_fail += len(ch)
+                job.setdefault("errors", []).append(
+                    f"• [Link {seq} {lane} Part {ci + 1} Crashed ({uploader['name']})]\n  Reason: {type(ce).__name__}: {ce}"
+                )
                 set_action(wname, f"❌ Part {ci + 1} ব্যর্থ: {type(ce).__name__}", busy=False)
                 print(f"⚠️ Link {seq} {lane} part {ci + 1} crashed ({uploader['name']}): {type(ce).__name__}: {ce}")
             finally:
@@ -2445,7 +2498,6 @@ async def process_one_link(client, user_id, job, uploaders, url, seq):
             except Exception:
                 pass
 
-    # ===== অ্যালবাম কমপ্লিট মেসেজ (স্টোরেজ চ্যানেলে) =====
     report = (
         f"✅ <b>Album completed</b>\n"
         f"📁 {htmllib.escape(title[:200])}\n"
@@ -2472,7 +2524,6 @@ async def process_link_queue(client, user_id, job):
     fatal_text = None
     dropped = 0
 
-    # অ্যালবামের ফাইল/পেজ সংখ্যার লিমিট তুলে দেওয়া (কাজ শেষে আগের মান ফিরে আসবে)
     saved_limits = {}
     for name, val in (("MAX_ITEMS_PER_ALBUM", 1_000_000), ("MAX_DETAIL_PAGES", 1000)):
         if hasattr(site_mod, name):
@@ -2485,6 +2536,8 @@ async def process_link_queue(client, user_id, job):
         assign_roles(uploaders)
         job["engine"] = engine_text(uploaders)
         job["workers"] = {u_["name"]: new_worker_state(u_) for u_ in uploaders}
+        job["skipped"] = list(skipped_uploaders)
+        job["tele_total"] = len(telethon_clients)
 
         seq = 0
         while True:
@@ -2495,7 +2548,7 @@ async def process_link_queue(client, user_id, job):
                 job["closed"] = True
                 break
             if not job["queue"]:
-                job["closed"] = True   # await ছাড়াই বন্ধ মার্ক - যাতে নতুন লিংক হারিয়ে না যায়
+                job["closed"] = True
                 break
 
             url = job["queue"].pop(0)
@@ -2589,9 +2642,14 @@ async def process_link_queue(client, user_id, job):
         if len(job["results"]) > 8:
             shown = f"...আগের {len(job['results']) - 8}টি বাদ\n" + shown
         summary += f"\n```text\n{shown}\n```"
+    job_errs = job.get("errors") or []
+    if job_errs:
+        err_shown = "\n".join(e[:220] for e in job_errs[:4])
+        if len(job_errs) > 4:
+            err_shown += f"\n...আরও {len(job_errs) - 4}টি ত্রুটি"
+        summary += f"\n⚠️ **ব্যর্থতার কারণ:**\n```text\n{err_shown}\n```"
     await update_panel(client, user_id, summary[:4000], end_kb)
 
-# ================= Web Service Port Binding (Railway/Render) =================
 web_app = Flask(__name__)
 
 @web_app.route("/")
@@ -2600,7 +2658,7 @@ def home():
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    web_app.run(host="0.0.0.0", port=port)
+    web_app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
 
 async def main():
     global backup_event, startup_db_status
@@ -2611,7 +2669,6 @@ async def main():
         status = f"Restore error: {e}"
     startup_db_status = status
     print(f"💾 {status}")
-    # রিস্টোরের জন্য Telethon খুললে সেটা বন্ধ করে দিই (শুধু দরকারে কানেক্ট হবে)
     await release_telethon()
 
     for i, pc in enumerate(pyro_clients, start=1):
@@ -2656,4 +2713,4 @@ async def main():
 
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
-    asyncio.get_event_loop().run_until_complete(main())
+    loop.run_until_complete(main())
