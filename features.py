@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-features.py  —  RedReels সেকশন (bot.py এর পাশেই রাখুন, bot.py কিছুই চেঞ্জ করতে হবে না)
+features.py — RedReels (bot.py এর পাশেই রাখুন; bot.py ও mmsdesi.py কিছুই বদলাতে হবে না)
 
-কীভাবে কাজ করে:
-  • bot.py এর discover_sites() প্রতিটা .py ফাইল লোড করে। এই ফাইলে মডিউল-লেভেলে
-    extract_albums / get_albums / HTML_CONTENT নেই, তাই এটা "সাইট" হিসেবে মেনুতে আসে না,
-    কিন্তু লোড হওয়ার সময়ই নিচের _install() চলে এবং RedReels ফিচারটা বটে জুড়ে দেয়।
-  • mmsdesi বা অন্য কোনো সাইট ফাইলের কোনো কিছু বদলায় না।
-  • স্ক্যান/আপলোড/ডুপ্লিকেট চেক/ক্যানসেল — সব bot.py এর আগের লজিকই ব্যবহার হয়।
+• "Add Html" নেই। "Scan Website" চাপলেই RedGifs API থেকে ট্রেন্ডিং ভিডিও আনে।
+• আগে আপলোড হওয়া ভিডিও বাদ দিয়ে প্রতি স্ক্যানে ১০০টি নতুন ভিডিও স্টোরেজ চ্যানেলে যায়
+  (১০০ লিমিট bot.py-এর MAX_ALBUMS_PER_SCAN থেকেও মানা হয়)।
+• ক্যাপশন = ওয়েবসাইটের টাইটেল/ডেসক্রিপশন (সাইটের #ট্যাগ মুছে ফেলা হয়) + আপনার HASHTAG।
+• আপলোড/ডুপ্লিকেট চেক/ক্যানসেল/ব্যাকআপ — সব bot.py এর আগের লজিকই ব্যবহার হয়।
 
-সাইট কনফিগ (আপনার দেওয়া):
-  SITE_NAME = "RedReels", HASHTAG = "#reels"
+দরকার: pip install curl_cffi aiohttp
 """
 import re
+import os
 import sys
+import json
+import time
 import types
 import asyncio
 import traceback
@@ -26,68 +27,227 @@ from pyrogram.types import (
     ReplyKeyboardMarkup, KeyboardButton
 )
 
+# ============================================================
+#  কনফিগ
+# ============================================================
 SITE_NAME = "RedReels"
-HASHTAG = "#reels"
+HASHTAG = "#reels"                  # আপনার নিজস্ব হ্যাশট্যাগ (এখানে বদলান)
 
-RR_KEY = "redreels"                 # ডাটাবেসে HTML সেভ করার key
-RR_LABEL = "RedReels"               # চ্যাট বক্সের নিচের মেনু বাটনের নাম
-RR_STATE_WAIT_HTML = "WAITING_RR_HTML"
+RR_KEY = "redreels"
+RR_LABEL = "RedReels"
+
+PER_SCAN = 100                      # প্রতি স্ক্যানে কয়টি ভিডিও
+PAGE_SIZE = 80                      # API প্রতি রিকোয়েস্টে সর্বোচ্চ
+MAX_PAGES = 25                      # নতুন ভিডিও না পেলে সর্বোচ্চ কত পেজ দেখবে
+API_BASE = "https://api.redgifs.com/v2"
+SEARCH_URL = API_BASE + "/gifs/search"
+AUTH_URL = API_BASE + "/auth/temporary"
+
+# ঐচ্ছিক: নিজের টোকেন দিতে চাইলে এনভায়রনমেন্ট ভ্যারিয়েবল REDGIFS_TOKEN সেট করুন।
+# না দিলে বট নিজে ফ্রি টেম্পরারি টোকেন নেবে (মেয়াদ শেষ হলে অটো রিনিউ)।
+ENV_TOKEN = os.environ.get("REDGIFS_TOKEN", "").strip()
+
+_UA = (
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/139.0.0.0 Mobile Safari/537.36"
+)
+_BASE_HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.9",
+    "origin": "https://www.redgifs.com",
+    "referer": "https://www.redgifs.com/",
+    "user-agent": _UA,
+}
+_DL_HEADERS = {
+    "User-Agent": _UA,
+    "Referer": "https://www.redgifs.com/",
+    "Origin": "https://www.redgifs.com",
+    "Accept": "*/*",
+}
 
 
 # ============================================================
-#  স্ক্যান লজিক (আপনার দেওয়া নিয়ম অনুযায়ী)
+#  ক্যাপশন/টাইটেল ক্লিন করা
 # ============================================================
-def _clean_html(html_content):
-    text = html_content or ""
-    text = text.replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
-    text = text.replace("\\u0026", "&").replace("\\u003d", "=").replace("\\u003D", "=")
-    text = htmllib.unescape(text)
+def _clean_caption(text):
+    text = htmllib.unescape(text or "")
+    text = re.sub(r"#\w+", "", text)          # ওয়েবসাইটের হ্যাশট্যাগ বাদ
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
+def _make_title(item):
+    title = _clean_caption(item.get("description") or "")
+    if not title:
+        raw_id = item.get("id") or ""
+        title = raw_id.replace("-", " ").replace("_", " ").title() if raw_id else ""
+    if not title:
+        title = "Video"
+    return title[:100]
+
+
+# ============================================================
+#  RedGifs API
+# ============================================================
+class _Auth:
+    token = ENV_TOKEN
+
+
+async def _refresh_token(session):
+    r = await session.get(AUTH_URL, headers=_BASE_HEADERS, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Token API error {r.status_code}")
+    tok = (r.json() or {}).get("token")
+    if not tok:
+        raise RuntimeError("Token not found in auth response")
+    _Auth.token = tok
+    return tok
+
+
+async def _get_page(session, page):
+    params = {
+        "type": "g", "order": "trending", "count": PAGE_SIZE,
+        "verified": "y", "page": page,
+    }
+    for attempt in range(2):
+        if not _Auth.token:
+            await _refresh_token(session)
+        headers = dict(_BASE_HEADERS)
+        headers["authorization"] = f"Bearer {_Auth.token}"
+        r = await session.get(SEARCH_URL, params=params, headers=headers, timeout=30)
+        if r.status_code in (401, 403) and attempt == 0:
+            _Auth.token = ""          # মেয়াদ শেষ -> নতুন টোকেন নিয়ে আবার চেষ্টা
+            continue
+        if r.status_code != 200:
+            raise RuntimeError(f"API error {r.status_code}")
+        return r.json()
+    raise RuntimeError("API auth failed")
+
+
+async def fetch_fresh_videos(is_duplicate, want=PER_SCAN, max_pages=MAX_PAGES):
+    """আগে আপলোড না হওয়া `want` টি ভিডিও খুঁজে বের করে। রিটার্ন: [(title, url), ...]"""
+    try:
+        from curl_cffi.requests import AsyncSession
+    except ImportError:
+        raise RuntimeError("curl_cffi ইনস্টল নেই। চালান: pip install curl_cffi")
+
+    found, seen = [], set()
+    async with AsyncSession(impersonate="chrome") as session:
+        page = 1
+        total_pages = max_pages
+        while len(found) < want and page <= min(max_pages, total_pages):
+            data = await _get_page(session, page)
+            total_pages = int(data.get("pages") or 1)
+            gifs = data.get("gifs") or []
+            if not gifs:
+                break
+            for item in gifs:
+                urls = item.get("urls") or {}
+                url = urls.get("hd") or urls.get("sd")
+                if not url:
+                    continue
+                url = url.split("?")[0]
+                if not re.search(r"\.(mp4|webm)$", url, re.IGNORECASE):
+                    continue
+                if url in seen:
+                    continue
+                seen.add(url)
+                try:
+                    if is_duplicate(url):
+                        continue
+                except Exception:
+                    pass
+                found.append((_make_title(item), url))
+                if len(found) >= want:
+                    break
+            page += 1
+            await asyncio.sleep(0.3)
+    return found
+
+
+# ============================================================
+#  bot.py এর "সাইট মডিউল" ফাংশনগুলো
+# ============================================================
 def rr_extract_albums(html_content):
+    """scan এর সময় fetch করা JSON এখানে আসে; প্রতিটি ভিডিও = একটি অ্যালবাম"""
     page_title = "RedReels Feed"
-    text = _clean_html(html_content)
-
-    # https://... এবং //cdn... (প্রোটোকল ছাড়া) দুই ধরনের লিংকই ধরবে
-    raw_urls = re.findall(
-        r'(?:https?:)?//[^\s"\'<>\\]+?\.(?:mp4|webm)(?![A-Za-z0-9])',
-        text, re.IGNORECASE
-    )
-
-    unique_urls = []
-    seen = set()
-    for url in raw_urls:
-        if url.startswith("//"):
-            url = "https:" + url
-        clean_url = url.split("?")[0]
-        if clean_url not in seen:
-            seen.add(clean_url)
-            unique_urls.append(clean_url)
-
     albums = []
-    for idx, url in enumerate(unique_urls):
-        title_match = re.search(r'/([^/]+)\.(?:mp4|webm)$', url, re.IGNORECASE)
-        raw_title = title_match.group(1) if title_match else f"Video_{idx + 1}"
-        title = (raw_title.replace("-mobile", "").replace("-hd", "")
-                 .replace("-", " ").replace("_", " ").title())
-
-        # প্রতিটি ভিডিও একটি আলাদা 'অ্যালবাম': প্রতি স্ক্যানে ১০০টি,
-        # পরের স্ক্যানে ডাটাবেস দেখে পরের ১০০টি
-        albums.append({
-            "title": title[:100],
-            "items": [("video", url)]
-        })
-
+    try:
+        data = json.loads(html_content or "{}")
+    except Exception:
+        return page_title, albums
+    for entry in data.get("videos", []):
+        title, url = entry[0], entry[1]
+        albums.append({"title": title, "items": [("video", url)]})
     return page_title, albums
 
 
-# bot.py এর process_and_upload() যে "সাইট মডিউল" আশা করে তার সমতুল্য অবজেক্ট
+def _rm(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+async def rr_custom_download(url, dest_path, state, progress_cb=None, max_bytes=None):
+    """bot.py এর download_file_with_details এই ফাংশন ব্যবহার করবে (Referer সহ ডাউনলোড)"""
+    import aiohttp
+    last_err = "Unknown"
+    for attempt in range(1, 4):
+        try:
+            if state and state.get("cancel"):
+                return False, "__CANCELLED__"
+            async with aiohttp.ClientSession(headers=_DL_HEADERS) as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    total = int(resp.headers.get("Content-Length") or 0)
+                    downloaded = 0
+                    last_cb = 0.0
+                    cancelled = False
+                    too_big = False
+                    with open(dest_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(1024 * 1024):
+                            if state and state.get("cancel"):
+                                cancelled = True
+                                break
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if max_bytes and downloaded > max_bytes:
+                                too_big = True
+                                break
+                            if progress_cb and time.monotonic() - last_cb >= 4:
+                                last_cb = time.monotonic()
+                                try:
+                                    await progress_cb(downloaded, total)
+                                except Exception:
+                                    pass
+                    if cancelled:
+                        _rm(dest_path)
+                        return False, "__CANCELLED__"
+                    if too_big:
+                        _rm(dest_path)
+                        return False, "File exceeds size limit."
+            if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+                raise RuntimeError("Downloaded file is 0 bytes.")
+            return True, "OK"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)}"
+        _rm(dest_path)
+        for _ in range(3 * attempt * 2):
+            if state and state.get("cancel"):
+                return False, "__CANCELLED__"
+            await asyncio.sleep(0.5)
+    return False, f"{last_err} (failed after 3 attempts)"
+
+
 _site_module = types.SimpleNamespace(
     SITE_NAME=SITE_NAME,
     HASHTAG=HASHTAG,
     HTML_CONTENT="",
     extract_albums=rr_extract_albums,
+    custom_download=rr_custom_download,
 )
 
 
@@ -111,7 +271,7 @@ def _find_main():
             return m
     for m in list(sys.modules.values()):
         if m is not None and hasattr(m, "discover_sites") and hasattr(m, "bot") \
-                and hasattr(m, "SITE_PREFIX") is not None and getattr(m, "__file__", "").endswith("bot.py"):
+                and getattr(m, "__file__", "").endswith("bot.py"):
             return m
     return None
 
@@ -124,82 +284,43 @@ def M():
 
 
 # ============================================================
-#  UI: কিবোর্ড ও টেক্সট
+#  UI
 # ============================================================
 def rr_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Add Html", callback_data="rr_add_html")],
         [InlineKeyboardButton("Scan Website", callback_data="rr_scan")],
         [InlineKeyboardButton("🏠 Home", callback_data="menu_home")],
     ])
 
 
-def rr_back_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Back", callback_data="rr_menu")],
-        [InlineKeyboardButton("🏠 Home", callback_data="menu_home")],
-    ])
-
-
-def _get_html(user_id):
-    m = M()
-    sess = m.user_sessions.get(user_id) or {}
-    html = (sess.get("custom_html") or {}).get(RR_KEY)
-    if not html:
-        html = m.db_get_site_html(RR_KEY)
-    return html
-
-
-def _status_text(user_id):
-    html = _get_html(user_id)
-    if not html:
-        return "📄 **HTML Status:** `Not added yet`"
-    try:
-        _t, albums = rr_extract_albums(html)
-        total = len(albums)
-        m = M()
-        fresh = sum(1 for a in albums if not m.is_duplicate(a["items"][0][1]))
-        return (
-            "📄 **HTML Status:** `Saved ✅`\n"
-            f"🎬 **Videos detected:** `{total}` | 🆕 **Not uploaded yet:** `{fresh}`"
-        )
-    except Exception as e:
-        return f"📄 **HTML Status:** `Saved` (parse error: {str(e)[:80]})"
-
-
-def _panel_text(user_id, note=""):
+def _panel_text(note=""):
     extra = f"{note}\n\n" if note else ""
     return (
         "🎬 **RedReels**\n\n"
-        "Please provide your project's HTML.\n"
-        "Send it as a `.html` file, or paste the HTML code right here.\n"
-        "The bot will automatically detect the video links (mp4 / webm) inside it.\n"
-        "Once the HTML is added, tap **Scan Website** to upload the videos to the storage channel.\n\n"
+        f"Tap **Scan Website** — the bot will fetch trending videos and upload "
+        f"`{PER_SCAN}` new videos to the storage channel (already-uploaded ones are skipped).\n\n"
         f"{extra}"
-        f"{_status_text(user_id)}\n\n"
         "Choose an option below 👇"
     )
 
 
 async def _show_panel_new(client, user_id, note=""):
-    """নতুন প্যানেল মেসেজ পাঠায় (পুরনোটা মুছে)"""
     m = M()
     sess = m.user_sessions.setdefault(user_id, {"state": "IDLE", "custom_html": {}})
     sess["state"] = "IDLE"
     await m.reset_panel(client, user_id)
-    await m.update_panel(client, user_id, _panel_text(user_id, note), rr_keyboard())
+    await m.update_panel(client, user_id, _panel_text(note), rr_keyboard())
 
 
 async def _show_panel_edit(client, user_id, note=""):
-    """বর্তমান প্যানেল মেসেজ এডিট করে"""
     m = M()
     sess = m.user_sessions.setdefault(user_id, {"state": "IDLE", "custom_html": {}})
     sess["state"] = "IDLE"
-    await m.update_panel(client, user_id, _panel_text(user_id, note), rr_keyboard())
+    await m.update_panel(client, user_id, _panel_text(note), rr_keyboard())
 
 
 # ============================================================
-#  ফিল্টার
+#  ফিল্টার ও হ্যান্ডলার
 # ============================================================
 _OPEN_RE = re.compile(r"^(?:🎬\s*)?RedReels$", re.IGNORECASE)
 
@@ -208,30 +329,9 @@ async def _f_open(_, __, message):
     return bool(message.text and _OPEN_RE.match(message.text.strip()))
 
 
-async def _f_wait_html(_, __, message):
-    if not message.from_user:
-        return False
-    try:
-        m = M()
-    except Exception:
-        return False
-    sess = m.user_sessions.get(message.from_user.id) or {}
-    if sess.get("state") != RR_STATE_WAIT_HTML:
-        return False
-    if message.text:
-        t = message.text.strip()
-        if t.startswith("/") or t.startswith(m.SITE_PREFIX) or _OPEN_RE.match(t):
-            return False
-    return True
-
-
 open_filter = filters.create(_f_open)
-wait_filter = filters.create(_f_wait_html)
 
 
-# ============================================================
-#  হ্যান্ডলার
-# ============================================================
 async def rr_open(client, message):
     try:
         user_id = message.from_user.id
@@ -246,84 +346,43 @@ async def rr_open(client, message):
     raise StopPropagation
 
 
-async def _save_html(client, message, html_content):
-    m = M()
-    user_id = message.from_user.id
-    sess = m.user_sessions.setdefault(user_id, {"state": "IDLE", "custom_html": {}})
-
-    _t, albums = rr_extract_albums(html_content)
-    if not albums:
-        await message.reply(
-            "⚠️ No video links (.mp4 / .webm) were found in this HTML.\n"
-            "Please send the correct HTML file or code."
-        )
-        return False
-
-    m.save_site_html(RR_KEY, html_content)
-    sess.setdefault("custom_html", {})[RR_KEY] = html_content
-    sess["state"] = "IDLE"
-    try:
-        await message.delete()
-    except Exception:
-        pass
-    await _show_panel_new(
-        client, user_id,
-        note=f"✅ **HTML saved.** Detected `{len(albums)}` video link(s)."
-    )
-    return True
-
-
-async def rr_html_text(client, message):
-    try:
-        text = (message.text or "").strip()
-        looks_like_html = bool(re.search(r"<\s*(!doctype|html|body|div|a\s|img|video|source|script)", text, re.I)) \
-            or bool(re.search(r"\.(mp4|webm)", text, re.I))
-        if not looks_like_html:
-            await message.reply(
-                "⚠️ This doesn't look like HTML code. Paste the full HTML or send a `.html` file."
-            )
-        else:
-            await _save_html(client, message, text)
-    except Exception as e:
-        print(f"RedReels html text error: {type(e).__name__}: {e}")
-        traceback.print_exc()
-    raise StopPropagation
-
-
-async def rr_html_document(client, message):
-    import os
-    path = None
-    try:
-        doc = message.document
-        name = (doc.file_name or "").lower()
-        if not name.endswith((".html", ".htm", ".txt")):
-            await message.reply("Only `.html`, `.htm` or `.txt` files are supported.")
-        else:
-            path = await message.download()
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                html_content = f.read()
-            await _save_html(client, message, html_content)
-    except Exception as e:
-        print(f"RedReels html doc error: {type(e).__name__}: {e}")
-        traceback.print_exc()
+async def _do_scan(client, cq, m, user_id, sess):
+    if sess.get("rr_scanning"):
         try:
-            await message.reply(f"❌ Error: `{type(e).__name__}: {str(e)[:150]}`")
+            await cq.answer("Scan already in progress, please wait.", show_alert=True)
         except Exception:
             pass
-    finally:
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-    raise StopPropagation
-
-
-async def _alert(cq, text):
+        return
+    sess["rr_scanning"] = True
     try:
-        await cq.answer(text, show_alert=True)
-    except Exception:
-        pass
+        await m.safe_answer(cq, "Fetching videos...")
+        sess["state"] = "IDLE"
+        await m.update_panel(
+            client, user_id,
+            "🔎 **RedReels**\n\nFetching new videos from the website, please wait...",
+            None
+        )
+
+        videos = await fetch_fresh_videos(m.is_duplicate)
+
+        if not videos:
+            await m.update_panel(
+                client, user_id,
+                "⚠️ No new videos found (everything fetched was already uploaded). Try again later.",
+                rr_keyboard()
+            )
+            return
+
+        payload = json.dumps({"videos": videos}, ensure_ascii=False)
+        started = await m.start_scan(client, user_id, _site(), payload)
+        if not started:
+            await m.update_panel(
+                client, user_id,
+                "⚠️ A scan or link queue is already running. Finish or cancel it first.",
+                rr_keyboard()
+            )
+    finally:
+        sess["rr_scanning"] = False
 
 
 async def rr_callbacks(client, cq):
@@ -337,35 +396,8 @@ async def rr_callbacks(client, cq):
         if data == "rr_menu":
             await m.safe_answer(cq)
             await _show_panel_edit(client, user_id)
-
-        elif data == "rr_add_html":
-            sess["state"] = RR_STATE_WAIT_HTML
-            await m.safe_answer(cq)
-            await m.update_panel(
-                client, user_id,
-                "📄 **RedReels — Add Html**\n\n"
-                "Send your project's HTML now:\n"
-                "• Upload a `.html` file, or\n"
-                "• Paste the HTML code directly.\n\n"
-                "It will be saved automatically and the video links will be detected for you.\n"
-                "Sending new HTML replaces the previously saved one.",
-                rr_back_keyboard()
-            )
-
         elif data == "rr_scan":
-            html = _get_html(user_id)
-            if not html:
-                await _alert(cq, "Please add your HTML first.")
-                return
-            await m.safe_answer(cq, "Starting scan...")
-            sess["state"] = "IDLE"
-            started = await m.start_scan(client, user_id, _site(), html)
-            if not started:
-                await m.update_panel(
-                    client, user_id,
-                    "⚠️ A scan or link queue is already running. Finish or cancel it first.",
-                    rr_keyboard()
-                )
+            await _do_scan(client, cq, m, user_id, sess)
         else:
             await m.safe_answer(cq)
 
@@ -383,11 +415,10 @@ async def rr_callbacks(client, cq):
 
 
 # ============================================================
-#  bot.py এর সাথে জুড়ে দেওয়া (monkey-patch + handlers)
+#  bot.py এর সাথে জুড়ে দেওয়া (bot.py ফাইল অপরিবর্তিত থাকে)
 # ============================================================
 def _apply(m):
     try:
-        # ১) চ্যাট বক্সের নিচের মেনুতে RedReels বাটন
         def patched_build_sites_reply_keyboard():
             rows = [[KeyboardButton(f"{m.SITE_PREFIX}{s['name']}")] for s in m.loaded_sites.values()]
             rows.append([KeyboardButton(RR_LABEL)])
@@ -395,7 +426,6 @@ def _apply(m):
 
         m.build_sites_reply_keyboard = patched_build_sites_reply_keyboard
 
-        # ২) স্ক্যান শেষে RedReels এর নিজের বাটন দেখানো (অন্য সাইটের আগের মতোই থাকবে)
         orig_get_site_keyboard = m.get_site_keyboard
 
         def patched_get_site_keyboard(site_key):
@@ -405,10 +435,7 @@ def _apply(m):
 
         m.get_site_keyboard = patched_get_site_keyboard
 
-        # ৩) হ্যান্ডলার (group -1 = bot.py এর হ্যান্ডলারের আগে চলবে)
         m.bot.add_handler(MessageHandler(rr_open, filters.private & filters.text & open_filter), group=-1)
-        m.bot.add_handler(MessageHandler(rr_html_text, filters.private & filters.text & wait_filter), group=-1)
-        m.bot.add_handler(MessageHandler(rr_html_document, filters.private & filters.document & wait_filter), group=-1)
         m.bot.add_handler(CallbackQueryHandler(rr_callbacks, filters.regex(r"^rr_")), group=-1)
 
         print("🎬 RedReels feature loaded (features.py)")
@@ -425,7 +452,6 @@ def _install():
         return
     m._redreels_installed = True
 
-    # bot.py এর সব ফাংশন ডিফাইন হওয়ার পর (event loop চালু হলে) প্যাচ করা হবে
     loop = getattr(m, "loop", None)
     if loop is None:
         loop = asyncio.get_event_loop()
