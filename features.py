@@ -37,6 +37,9 @@ RR_KEY = "redreels"
 RR_LABEL = "RedReels"
 
 PER_SCAN = 100                      # প্রতি স্ক্যানে কয়টি ভিডিও
+SHOW_TYPE_IN_CAPTION = True         # True = ক্যাপশনে ভিডিওর টাইপ (Vertical • FHD • 12s • Audio • ক্যাটাগরি) দেখাবে
+UNORDERED_UPLOAD = True             # True = যে আইডি আগে ডাউনলোড শেষ করবে সে আগে আপলোড করবে (ক্রম মানবে না)
+SEND_TYPE_REPORT = True             # True = স্ক্যানের আগে টাইপ-ভিত্তিক সারসংক্ষেপ মেসেজ পাঠাবে
 PAGE_SIZE = 80                      # API প্রতি রিকোয়েস্টে সর্বোচ্চ
 MAX_PAGES = 25                      # নতুন ভিডিও না পেলে সর্বোচ্চ কত পেজ দেখবে
 API_BASE = "https://api.redgifs.com/v2"
@@ -84,6 +87,74 @@ def _make_title(item):
     if not title:
         title = "Video"
     return title[:100]
+
+
+def _pretty(word):
+    word = str(word or "").replace("#", "").replace("-", " ").replace("_", " ").strip()
+    return word.title()
+
+
+def _detect_type(item):
+    """API-র মেটাডাটা (সাইজ, সময়, অডিও, niches/tags) থেকে ভিডিওর টাইপ বের করে"""
+    try:
+        w = int(item.get("width") or 0)
+        h = int(item.get("height") or 0)
+    except Exception:
+        w = h = 0
+    try:
+        dur = float(item.get("duration") or 0)
+    except Exception:
+        dur = 0.0
+
+    if w and h:
+        if h >= w * 1.15:
+            orient = "Vertical"
+        elif w >= h * 1.15:
+            orient = "Horizontal"
+        else:
+            orient = "Square"
+    else:
+        orient = ""
+
+    short_side = min(w, h) if (w and h) else 0
+    if short_side >= 2160:
+        quality = "4K"
+    elif short_side >= 1080:
+        quality = "FHD"
+    elif short_side >= 720:
+        quality = "HD"
+    elif short_side > 0:
+        quality = "SD"
+    else:
+        quality = ""
+
+    if dur <= 0:
+        length = ""
+    elif dur < 60:
+        length = f"{int(round(dur))}s"
+    else:
+        length = f"{int(dur // 60)}m{int(dur % 60):02d}s"
+
+    audio = bool(item.get("hasAudio"))
+
+    cats = []
+    for src in (item.get("niches") or [], item.get("tags") or []):
+        for c in src:
+            c = _pretty(c)
+            if c and c not in cats:
+                cats.append(c)
+        if cats:
+            break
+    category = " / ".join(cats[:2])
+
+    parts = [orient, quality, length, "Audio" if audio else "", category]
+    return {
+        "orientation": orient or "Unknown",
+        "quality": quality,
+        "audio": audio,
+        "category": cats[0] if cats else "",
+        "label": " • ".join(p for p in parts if p),
+    }
 
 
 # ============================================================
@@ -157,7 +228,7 @@ async def fetch_fresh_videos(is_duplicate, want=PER_SCAN, max_pages=MAX_PAGES):
                         continue
                 except Exception:
                     pass
-                found.append((_make_title(item), url))
+                found.append((_make_title(item), url, _detect_type(item)))
                 if len(found) >= want:
                     break
             page += 1
@@ -178,7 +249,11 @@ def rr_extract_albums(html_content):
         return page_title, albums
     for entry in data.get("videos", []):
         title, url = entry[0], entry[1]
-        albums.append({"title": title, "items": [("video", url)]})
+        info = entry[2] if len(entry) > 2 and isinstance(entry[2], dict) else {}
+        label = info.get("label") or ""
+        if SHOW_TYPE_IN_CAPTION and label:
+            title = f"{title} — {label}"
+        albums.append({"title": title[:190], "items": [("video", url)]})
     return page_title, albums
 
 
@@ -373,8 +448,40 @@ async def _do_scan(client, cq, m, user_id, sess):
             )
             return
 
+        if SEND_TYPE_REPORT:
+            try:
+                from collections import Counter
+                orient = Counter(v[2].get("orientation", "Unknown") for v in videos)
+                cats = Counter(v[2].get("category") for v in videos if v[2].get("category"))
+                audio_n = sum(1 for v in videos if v[2].get("audio"))
+                lines = [f"🔎 **Detected `{len(videos)}` new videos**", ""]
+                lines.append("📐 " + " | ".join(f"{k}: `{n}`" for k, n in orient.most_common()))
+                lines.append(f"🔊 With audio: `{audio_n}`")
+                if cats:
+                    lines.append("🗂 Top categories: " + ", ".join(f"{k} (`{n}`)" for k, n in cats.most_common(5)))
+                await client.send_message(user_id, "\n".join(lines))
+            except Exception as rep_err:
+                print(f"RedReels type report error: {rep_err}")
+
         payload = json.dumps({"videos": videos}, ensure_ascii=False)
+
+        # শুধু RedReels স্ক্যানের সময় ORDERED_ALBUMS বন্ধ রাখা হয় (যে আগে ডাউনলোড শেষ করবে সে আগে আপলোড করবে)।
+        # স্ক্যান শেষ হলেই আগের মান ফিরে আসে, তাই mmsdesi-র ক্রম অপরিবর্তিত থাকে।
+        orig_ordered = getattr(m, "ORDERED_ALBUMS", True)
+        if UNORDERED_UPLOAD:
+            m.ORDERED_ALBUMS = False
         started = await m.start_scan(client, user_id, _site(), payload)
+        if started and UNORDERED_UPLOAD:
+            try:
+                task = (m.active_scans.get(user_id) or {}).get("task")
+                if task is not None:
+                    task.add_done_callback(lambda _t, _o=orig_ordered: setattr(m, "ORDERED_ALBUMS", _o))
+                else:
+                    m.ORDERED_ALBUMS = orig_ordered
+            except Exception:
+                m.ORDERED_ALBUMS = orig_ordered
+        elif UNORDERED_UPLOAD:
+            m.ORDERED_ALBUMS = orig_ordered
         if not started:
             await m.update_panel(
                 client, user_id,
